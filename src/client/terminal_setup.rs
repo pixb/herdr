@@ -160,6 +160,7 @@ struct HostKeyboardProbeResponses {
     flags: Option<u16>,
     sgr_pixel_mouse_status: Option<u8>,
     primary_device_attributes: bool,
+    sixel_supported: bool,
 }
 
 /// What the startup probe learned about the host terminal.
@@ -168,6 +169,8 @@ pub(super) struct HostTerminalProbe {
     pub(super) escape_disambiguation: bool,
     /// None when the host did not answer; exact pixel input stays disabled.
     pub(super) sgr_pixel_mouse: Option<bool>,
+    /// The host's primary DA answer listed Sixel graphics (feature code 4).
+    pub(super) sixel_supported: bool,
 }
 
 #[cfg(not(windows))]
@@ -246,7 +249,14 @@ fn host_terminal_probe(responses: &HostKeyboardProbeResponses) -> HostTerminalPr
     HostTerminalProbe {
         escape_disambiguation: host_escape_disambiguation_confirmed(responses),
         sgr_pixel_mouse,
+        sixel_supported: responses.sixel_supported,
     }
+}
+
+/// Whether a primary DA body (`62;4;22;...`) lists Sixel graphics (feature 4).
+#[cfg(not(windows))]
+fn da1_lists_sixel(body: &[u8]) -> bool {
+    body.split(|byte| *byte == b';').any(|field| field == b"4")
 }
 
 #[cfg(not(windows))]
@@ -334,6 +344,9 @@ fn consume_host_keyboard_probe_responses(
                     .all(|byte| byte.is_ascii_digit() || *byte == b';') =>
             {
                 responses.primary_device_attributes = true;
+                if da1_lists_sixel(body) {
+                    responses.sixel_supported = true;
+                }
                 true
             }
             _ => false,
@@ -1152,6 +1165,48 @@ mod tests {
 
         assert!(!responses.primary_device_attributes);
         assert_eq!(host_terminal_probe(&responses).sgr_pixel_mouse, Some(false));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn host_probe_detects_sixel_only_from_a_listed_da_feature() {
+        for (da, expected) in [
+            (b"\x1b[?62;4;22;10c".as_slice(), true),
+            (b"\x1b[?62;22;10;19c".as_slice(), false),
+            (b"\x1b[?1;2c".as_slice(), false),
+            (b"\x1b[?63;4c".as_slice(), true),
+            (b"\x1b[?62;4;4c".as_slice(), true),
+        ] {
+            let mut buffered = da.to_vec();
+            let mut responses = HostKeyboardProbeResponses::default();
+            consume_host_keyboard_probe_responses(&mut buffered, &mut responses);
+            assert_eq!(
+                host_terminal_probe(&responses).sixel_supported,
+                expected,
+                "da {da:?}"
+            );
+            assert!(buffered.is_empty(), "da {da:?}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn host_probe_detects_sixel_across_fragmented_device_attributes() {
+        let stream = b"\x1b[?62;4;22cinput".to_vec();
+        for split in 1..stream.len() {
+            let mut buffered = Vec::new();
+            let mut responses = HostKeyboardProbeResponses::default();
+            buffered.extend_from_slice(&stream[..split]);
+            consume_host_keyboard_probe_responses(&mut buffered, &mut responses);
+            buffered.extend_from_slice(&stream[split..]);
+            consume_host_keyboard_probe_responses(&mut buffered, &mut responses);
+
+            assert!(
+                host_terminal_probe(&responses).sixel_supported,
+                "split {split}"
+            );
+            assert_eq!(buffered, b"input", "split {split}");
+        }
     }
 
     #[cfg(not(windows))]

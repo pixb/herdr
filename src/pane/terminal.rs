@@ -204,6 +204,15 @@ pub(crate) struct GhosttyPaneCore {
     recent_fallback: windows_recent_fallback::Cache,
     pub render_state: crate::ghostty::RenderState,
     pub kitty_keyboard: KittyKeyboardTracker,
+    /// Streaming Sixel frame scanner for the child byte stream.
+    pub sixel: crate::sixel::SixelExtractor,
+    /// Host cell size in pixels; Sixel images map to grid cells through them.
+    pub cell_width_px: u32,
+    pub cell_height_px: u32,
+    /// Synthetic image IDs relayed for this pane; deleted when the child
+    /// clears the screen or toggles DECSDM (the VT core keeps Kitty
+    /// placements on ED).
+    pub sixel_image_ids: Vec<u32>,
     pub initial_default_foreground: Option<crate::ghostty::RgbColor>,
     pub initial_default_background: Option<crate::ghostty::RgbColor>,
     pub host_terminal_theme: crate::terminal_theme::TerminalTheme,
@@ -222,6 +231,57 @@ pub(crate) struct GhosttyPaneCore {
 
 pub(crate) struct PaneTerminal {
     pub(crate) ghostty: GhosttyPaneTerminal,
+}
+
+/// One byte range of a child batch split at Sixel frame boundaries.
+struct SixelSegment {
+    start: usize,
+    end: usize,
+    /// Pixel height of the frame ending at `end`; `None` for the trailing
+    /// segment after the last frame, which never gets an injection.
+    inject: Option<u32>,
+    /// Decoder input for the frame ending at `end` (ESC P…q header and ST
+    /// excluded); `None` for segments that do not end at a frame.
+    payload: Option<Vec<u8>>,
+}
+
+/// Split `bytes` at every Sixel frame boundary and record which segments
+/// end exactly at a frame (so the write path can inject a synthetic cursor
+/// advance there). The scanner runs even while Sixel is disabled unless
+/// the mode is explicitly off, keeping the frame boundary state consistent
+/// if the mode flips at runtime.
+fn collect_sixel_segments(core: &mut GhosttyPaneCore, bytes: &[u8]) -> Vec<SixelSegment> {
+    if crate::sixel::mode() == Some(false) {
+        return Vec::new();
+    }
+    let mut frames = Vec::new();
+    core.sixel.feed(bytes, &mut frames);
+    if frames.is_empty() {
+        return Vec::new();
+    }
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for frame in frames {
+        let end = frame.tail_offset.min(bytes.len());
+        if end > start {
+            segments.push(SixelSegment {
+                start,
+                end,
+                inject: Some(frame.pixel_height),
+                payload: Some(frame.payload),
+            });
+            start = end;
+        }
+    }
+    if start < bytes.len() {
+        segments.push(SixelSegment {
+            start,
+            end: bytes.len(),
+            inject: None,
+            payload: None,
+        });
+    }
+    segments
 }
 
 impl PaneTerminal {
@@ -1190,6 +1250,10 @@ impl GhosttyPaneTerminal {
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
                 kitty_keyboard: KittyKeyboardTracker::default(),
+                sixel: crate::sixel::SixelExtractor::default(),
+                cell_width_px: 0,
+                cell_height_px: 16,
+                sixel_image_ids: Vec::new(),
                 initial_default_foreground,
                 initial_default_background,
                 host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
@@ -1508,6 +1572,133 @@ impl GhosttyPaneTerminal {
             )
             .collect();
         events.sort_by_key(OrderedColorOrC1Event::end_offset);
+
+        // Sixel frames split the stream: the child's raw bytes all reach the
+        // parser untouched, but a synthetic cursor advance is injected right
+        // after each complete frame so subsequent text starts below the image.
+        let segments = collect_sixel_segments(core, bytes);
+        // M3: a child-initiated screen erase or DECSDM toggle must drop this
+        // pane's relayed Sixel images (the VT core keeps Kitty placements on
+        // ED, so they would otherwise linger on screen). Checked at batch
+        // level too so batches without frames (a bare `ESC [ 2 J`) still
+        // clear; the segment-level check below handles clears after frames.
+        if crate::sixel::extractor::scan_clear(bytes).is_some()
+            && !core.sixel_image_ids.is_empty()
+        {
+            let ids = core.sixel_image_ids.drain(..).collect::<Vec<_>>();
+            let mut delete = Vec::new();
+            for id in ids {
+                crate::kitty_graphics::encode_delete_image(&mut delete, id);
+            }
+            core.terminal.write(&delete);
+        }
+        if segments.is_empty() {
+            self.write_pty_bytes_segment(
+                core,
+                bytes,
+                events,
+                in_progress_default_color_event,
+                terminal_responses,
+            );
+            return;
+        }
+
+        let mut events = events.into_iter().peekable();
+        let segment_count = segments.len();
+        for (index, segment) in segments.into_iter().enumerate() {
+            let (seg_start, seg_end) = (segment.start, segment.end);
+            // M3: a child-initiated screen erase or DECSDM toggle must drop
+            // this pane's relayed Sixel images (the VT core keeps Kitty
+            // placements on ED, so they would otherwise linger on screen).
+            if crate::sixel::extractor::scan_clear(&bytes[seg_start..seg_end]).is_some()
+                && !core.sixel_image_ids.is_empty()
+            {
+                let ids = core.sixel_image_ids.drain(..).collect::<Vec<_>>();
+                let mut delete = Vec::new();
+                for id in ids {
+                    crate::kitty_graphics::encode_delete_image(&mut delete, id);
+                }
+                core.terminal.write(&delete);
+            }
+            let mut segment_events = Vec::new();
+            while let Some(event) = events.peek() {
+                let offset = event.end_offset();
+                if offset > seg_end {
+                    break;
+                }
+                if offset > seg_start {
+                    segment_events.push(events.next().expect("peeked event"));
+                    continue;
+                }
+                // Offsets at or before the segment start were consumed by an
+                // earlier segment; drop them defensively.
+                events.next();
+            }
+            for event in &mut segment_events {
+                match event {
+                    OrderedColorOrC1Event::Color(tracked) => {
+                        tracked.end_offset = tracked.end_offset.saturating_sub(seg_start);
+                    }
+                    OrderedColorOrC1Event::C1(response) => {
+                        response.end_offset = response.end_offset.saturating_sub(seg_start);
+                    }
+                }
+            }
+            let segment_in_progress = if index + 1 == segment_count {
+                in_progress_default_color_event
+            } else {
+                None
+            };
+            self.write_pty_bytes_segment(
+                core,
+                &bytes[seg_start..seg_end],
+                segment_events,
+                segment_in_progress,
+                terminal_responses,
+            );
+
+            if let Some(pixel_height) = segment.inject {
+                // M2: decode the completed frame and relay it into the same
+                // terminal core as a Kitty image. The placement lands at the
+                // current cursor (the frame's start); the synthetic advance
+                // below then starts trailing text below the image.
+                if let Some(payload) = segment.payload.as_deref() {
+                    let background = core
+                        .initial_default_background
+                        .map(|color| [color.r, color.g, color.b, 255]);
+                    if let Some(image_id) = crate::sixel::forward::relay_sixel_frame(
+                        &mut core.terminal,
+                        payload,
+                        pixel_height,
+                        core.cell_width_px,
+                        core.cell_height_px,
+                        background,
+                    ) {
+                        core.sixel_image_ids.push(image_id);
+                    }
+                }
+                let peek = &bytes[seg_end..];
+                if crate::sixel::extractor::needs_synthetic_cursor(peek) {
+                    let rows = crate::sixel::extractor::pixel_height_to_rows(
+                        pixel_height,
+                        core.cell_height_px,
+                    );
+                    let advance = crate::sixel::extractor::synthetic_cursor_advance(rows);
+                    core.terminal.write(&advance);
+                    terminal_responses.extend(self.drain_pending_pty_responses());
+                }
+            }
+        }
+    }
+
+    fn write_pty_bytes_segment(
+        &self,
+        core: &mut GhosttyPaneCore,
+        bytes: &[u8],
+        events: Vec<OrderedColorOrC1Event>,
+        in_progress_default_color_event: Option<DefaultColorEvent>,
+        terminal_responses: &mut Vec<Bytes>,
+    ) {
         let mut written = 0;
         for event in events {
             let end_offset = event.end_offset().min(bytes.len());
@@ -1728,6 +1919,8 @@ impl GhosttyPaneTerminal {
             let _ = core
                 .terminal
                 .resize(cols, rows, cell_width_px, cell_height_px);
+            core.cell_width_px = cell_width_px;
+            core.cell_height_px = cell_height_px;
             let synchronized_output_after = core
                 .terminal
                 .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
@@ -3668,6 +3861,18 @@ mod tests {
     use ratatui::{layout::Rect, style::Color};
     use tokio::sync::mpsc;
 
+    /// Serializes tests that mutate the global `crate::sixel` mode so a
+    /// `mode=off` test cannot observe another test's `None`/`On` window.
+    static SIXEL_MODE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn sixel_mode_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        SIXEL_MODE_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("sixel test lock")
+    }
+
     #[test]
     fn plain_page_keys_host_scroll_for_shell_like_decckm_with_bracketed_paste() {
         assert!(InputState {
@@ -4185,7 +4390,6 @@ mod tests {
         let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
         let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
         let pane_id = PaneId::from_raw(1);
-
         assert!(
             !pane
                 .process_pty_bytes(pane_id, 0, b"\x1b]0;buil", &tx)
@@ -4204,6 +4408,292 @@ mod tests {
             pane.process_pty_bytes(pane_id, 0, b"\x1b]2;done\x07", &tx)
                 .terminal_title_changed
         );
+    }
+
+    #[test]
+    fn sixel_frame_places_trailing_text_below_the_image() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"A", &tx);
+        assert_eq!(pane.cursor_state().map(|c| (c.x, c.y)), Some((1, 0)));
+
+        // Four bands => 24px; default 16px cells => two rows of advance.
+        let result = pane.process_pty_bytes(
+            pane_id,
+            0,
+            b"\x1bPq#1;2;100;100~~~---~\x1b\\tail",
+            &tx,
+        );
+        assert_eq!(result.request_render, true);
+        let (x, y) = pane
+            .cursor_state()
+            .map(|cursor| (cursor.x, cursor.y))
+            .expect("cursor");
+        assert_eq!((x, y), (4, 2), "trailing text starts below the image");
+    }
+
+    #[test]
+    fn sixel_frame_skips_injection_when_child_positions_cursor() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"A", &tx);
+        // The child immediately positions the cursor; no synthetic advance.
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq~~~---~\x1b\\\x1b[5;10H", &tx);
+
+        let (x, y) = pane
+            .cursor_state()
+            .map(|cursor| (cursor.x, cursor.y))
+            .expect("cursor");
+        assert_eq!((x, y), (9, 4));
+    }
+
+    #[test]
+    fn sixel_frame_at_batch_end_advances_cursor_for_next_batch() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"A", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq~\x1b\\", &tx);
+
+        let (x, y) = pane
+            .cursor_state()
+            .map(|cursor| (cursor.x, cursor.y))
+            .expect("cursor");
+        assert_eq!((x, y), (0, 1));
+
+        pane.process_pty_bytes(pane_id, 0, b"tail", &tx);
+        let (x, y) = pane
+            .cursor_state()
+            .map(|cursor| (cursor.x, cursor.y))
+            .expect("cursor");
+        assert_eq!((x, y), (4, 1));
+    }
+
+    #[test]
+    fn non_sixel_dcs_does_not_move_the_cursor() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"A", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1bP1000pGARBAGE\x1b\\X", &tx);
+
+        let (x, y) = pane
+            .cursor_state()
+            .map(|cursor| (cursor.x, cursor.y))
+            .expect("cursor");
+        assert_eq!((x, y), (2, 0));
+    }
+
+    #[test]
+    fn sixel_frame_materializes_a_kitty_placement_in_the_parser() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        // The production pane path enables image storage before any write.
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        // Host cell 10x16 px; the frame is 20px wide, 12px tall.
+        pane.resize(24, 80, 10, 16);
+
+        // Band 0: 20 red pixels wide; band 1: one pixel at column 0.
+        let result = pane.process_pty_bytes(
+            pane_id,
+            0,
+            b"\x1bPq#1;100;0;0!20~-\x40\x1b\\tail",
+            &tx,
+        );
+        assert_eq!(result.request_render, true);
+
+        let core = pane.core.lock().unwrap();
+        let placements = core
+            .terminal
+            .kitty_image_placements()
+            .expect("placements");
+        assert_eq!(placements.len(), 1, "relayed frame lands in the parser");
+        let placement = &placements[0];
+        assert_eq!(placement.image_width, 20);
+        assert_eq!(placement.image_height, 12);
+        assert_eq!(placement.format, crate::ghostty::KittyImageFormat::Rgba);
+        // 20px / 10px cell = 2 cols; 12px / 16px cell = 1 row.
+        assert_eq!(placement.render.grid_cols, 2);
+        assert_eq!(placement.render.grid_rows, 1);
+        drop(core);
+
+        // The synthetic advance still places trailing text below the image:
+        // rows = ceil(12 / 16) = 1, then "tail" writes 4 columns.
+        let (x, y) = pane
+            .cursor_state()
+            .map(|cursor| (cursor.x, cursor.y))
+            .expect("cursor");
+        assert_eq!((x, y), (4, 1), "trailing text below the image");
+    }
+
+    #[test]
+    fn child_ed_clears_relayed_sixel_images() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~\x1b\\", &tx);
+        assert_eq!(
+            pane.core.lock().unwrap().terminal.kitty_image_placements().unwrap().len(),
+            1,
+            "frame relayed before the clear"
+        );
+
+        // ED 2J clears the screen; the VT core keeps Kitty placements, so the
+        // write path must delete the relayed images explicitly.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J", &tx);
+        let core = pane.core.lock().unwrap();
+        assert!(
+            core.terminal.kitty_image_placements().unwrap().is_empty(),
+            "relayed image removed after ED"
+        );
+        assert!(core.sixel_image_ids.is_empty(), "tracked ids drained");
+    }
+
+    #[test]
+    fn decsdm_toggle_clears_relayed_sixel_images() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq!20~\x1b\\", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?80l", &tx);
+        assert!(
+            pane.core.lock().unwrap().terminal.kitty_image_placements().unwrap().is_empty(),
+            "DECSDM reset erases Sixel images"
+        );
+    }
+
+    #[test]
+    fn two_frames_coexist_until_cleared() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq!20~\x1b\\", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq!10~\x1b\\", &tx);
+        let core = pane.core.lock().unwrap();
+        let placements = core.terminal.kitty_image_placements().unwrap();
+        assert_eq!(placements.len(), 2, "both frames remain placed");
+        assert_eq!(core.sixel_image_ids.len(), 2, "both ids tracked");
+    }
+
+    #[test]
+    fn sixel_image_survives_scroll_within_the_viewport() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~\x1b\\", &tx);
+        assert_eq!(
+            pane.core.lock().unwrap().terminal.kitty_image_placements().unwrap().len(),
+            1,
+            "frame placed before scrolling"
+        );
+        // Scrolling a few lines keeps the placement anchored to its cell and
+        // visible; the VT core owns the scrollback lifecycle for free.
+        for _ in 0..5 {
+            pane.process_pty_bytes(pane_id, 0, b"\n", &tx);
+        }
+        let placements = pane.core.lock().unwrap().terminal.kitty_image_placements().unwrap();
+        assert_eq!(placements.len(), 1, "image follows text within the viewport");
+    }
+
+    #[test]
+    fn sixel_realistic_frame_end_to_end_places_image() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.resize(24, 80, 10, 16);
+        let pane_id = PaneId::from_raw(1);
+
+        // A chafa/libsixel-style frame (see tests/fixtures/sixel/).
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sixel/rainbow_palette.six"
+        );
+        let payload = std::fs::read(path).expect("fixture present");
+        let mut frame = b"\x1bPq".to_vec();
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(b"\x1b\\");
+
+        pane.process_pty_bytes(pane_id, 0, &frame, &tx);
+        let core = pane.core.lock().unwrap();
+        let placements = core.terminal.kitty_image_placements().unwrap();
+        assert_eq!(placements.len(), 1, "frame materialized as one placement");
+        let placement = &placements[0];
+        assert_eq!((placement.image_width, placement.image_height), (128, 144));
+        assert_eq!(placement.format, crate::ghostty::KittyImageFormat::Rgba);
+        // RGBA payload arrives intact: sample band 0 col 0 = palette #1.
+        let width = 128usize;
+        let at = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * width + x) * 4;
+            placement.data[o..o + 4].try_into().unwrap()
+        };
+        assert_eq!(at(0, 0), [51, 51, 204, 255]);
+        assert_eq!(at(1, 0), [204, 33, 33, 255]);
+        assert_eq!(at(40, 16 * 6), [51, 0, 204, 255]);
+    }
+
+    #[test]
+    fn sixel_mode_off_leaves_the_cursor_alone() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(Some(false));
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"A", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq~~~---~\x1b\\tail", &tx);
+
+        let (x, y) = pane
+            .cursor_state()
+            .map(|cursor| (cursor.x, cursor.y))
+            .expect("cursor");
+        assert_eq!((x, y), (5, 0));
+        crate::sixel::set_mode(None);
     }
 
     #[test]

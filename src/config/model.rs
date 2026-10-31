@@ -260,6 +260,19 @@ pub struct TerminalConfig {
     pub new_cwd: NewTerminalCwdConfig,
     /// Render Kitty graphics in compatible outer terminals. Default: true.
     pub kitty_graphics: Option<bool>,
+    /// Render Sixel graphics from child panes in compatible outer terminals.
+    /// `auto` forwards Sixel only when the outer terminal reports Sixel
+    /// support; `on`/`off` force it. Default: auto.
+    pub sixel: SixelModeConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SixelModeConfig {
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2052,6 +2065,30 @@ kitty_graphics = false
         )
         .unwrap();
         assert!(!config.kitty_graphics_enabled());
+    }
+
+    #[test]
+    fn sixel_defaults_to_auto_and_parses_on_off() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.terminal.sixel, SixelModeConfig::Auto);
+
+        let on: Config = toml::from_str(
+            r#"
+[terminal]
+sixel = "on"
+"#,
+        )
+        .unwrap();
+        assert_eq!(on.terminal.sixel, SixelModeConfig::On);
+
+        let off: Config = toml::from_str(
+            r#"
+[terminal]
+sixel = "off"
+"#,
+        )
+        .unwrap();
+        assert_eq!(off.terminal.sixel, SixelModeConfig::Off);
     }
 
     #[test]

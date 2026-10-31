@@ -24,8 +24,8 @@ pub use self::{
     model::{
         validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
         ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig,
-        ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
-        ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
+        ShellModeConfig, SidebarCollapsedModeConfig, SixelModeConfig, StatusIndicatorStyle,
+        TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
         UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
@@ -100,6 +100,16 @@ impl Config {
             .kitty_graphics
             .or(self.experimental.kitty_graphics)
             .unwrap_or(true)
+    }
+
+    /// Sixel rendering mode. `Some(true)` forces on, `Some(false)` forces off,
+    /// `None` defers to the outer terminal's reported capability.
+    pub fn sixel_mode(&self) -> Option<bool> {
+        match self.terminal.sixel {
+            SixelModeConfig::On => Some(true),
+            SixelModeConfig::Off => Some(false),
+            SixelModeConfig::Auto => None,
+        }
     }
 
     pub fn prefix_keys(&self) -> Vec<(KeyCode, KeyModifiers)> {
