@@ -235,6 +235,35 @@ pub(super) fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io:
 }
 
 const HOST_CELL_SIZE_QUERY: &[u8] = b"\x1b[16t";
+const HOST_SCREEN_PIXELS_QUERY: &[u8] = b"\x1b[15t";
+
+/// Cell pitch in the pixel space the terminal paints graphics into.
+///
+/// `CSI 15 ; height ; width t` reports the screen extent in the device pixels
+/// the terminal composites in, so dividing by the grid yields the pitch a
+/// painted raster must use to cover N cells. `CSI 6 ; height ; width t` reports
+/// the cell size in the terminal's scaled space, which is smaller on a scaled
+/// display, and an ioctl reports the unscaled font metrics.
+#[cfg(any(unix, test))]
+pub(super) fn device_cell_size(
+    reported_screen_pixels: u64,
+    columns: u32,
+    rows: u32,
+    fallback: (u32, u32),
+) -> (u32, u32) {
+    let Some((screen_width_px, screen_height_px)) = unpack_cell_size(reported_screen_pixels) else {
+        return fallback;
+    };
+    if columns == 0 || rows == 0 {
+        return fallback;
+    }
+    let width_px = screen_width_px / columns;
+    let height_px = screen_height_px / rows;
+    if width_px == 0 || height_px == 0 {
+        return fallback;
+    }
+    (width_px, height_px)
+}
 
 pub(super) fn query_host_cell_size() {
     let _ = write_host_cell_size_query(io::stdout());
@@ -251,6 +280,46 @@ pub(super) fn host_cell_size_query_required(needs_pixel_geometry: bool) -> bool 
 pub(super) fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {
     writer.write_all(HOST_CELL_SIZE_QUERY)?;
     writer.flush()
+}
+
+pub(super) fn query_host_screen_pixels() {
+    let _ = write_host_screen_pixels_query(io::stdout());
+}
+
+pub(super) fn write_host_screen_pixels_query(mut writer: impl io::Write) -> io::Result<()> {
+    writer.write_all(HOST_SCREEN_PIXELS_QUERY)?;
+    writer.flush()
+}
+
+/// The screen extent is only needed to size painted graphics, and ConPTY does
+/// not answer pixel queries.
+pub(super) fn screen_pixels_query_required(needs_pixel_geometry: bool) -> bool {
+    needs_pixel_geometry && should_query_host_cell_size()
+}
+
+#[cfg(unix)]
+pub(super) fn store_reported_screen_pixels(
+    reported_screen_pixels: &AtomicU64,
+    width_px: u32,
+    height_px: u32,
+) {
+    let packed = pack_cell_size(width_px, height_px);
+    if reported_screen_pixels.swap(packed, Ordering::AcqRel) != packed {
+        debug!(width_px, height_px, "host terminal reported screen pixels");
+    }
+}
+
+#[cfg(any(unix, test))]
+pub(super) fn reported_screen_pixels_from_events(
+    events: &[crate::raw_input::RawInputEvent],
+) -> Option<(u32, u32)> {
+    events.iter().rev().find_map(|event| match event {
+        crate::raw_input::RawInputEvent::HostScreenPixelsReport {
+            width_px,
+            height_px,
+        } => Some((*width_px, *height_px)),
+        _ => None,
+    })
 }
 
 #[cfg(unix)]

@@ -547,6 +547,41 @@ fn cell_size_fallback_prefers_reported_then_previous_size() {
 }
 
 #[test]
+fn painted_cell_size_uses_the_reported_screen_extent() {
+    let mut out = Vec::new();
+    super::terminal_geometry::write_host_screen_pixels_query(&mut out).unwrap();
+    assert_eq!(out, b"\x1b[15t");
+
+    let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[15;1080;1920t");
+    assert_eq!(
+        super::terminal_geometry::reported_screen_pixels_from_events(&events),
+        Some((1920, 1080))
+    );
+
+    let reported = super::terminal_geometry::pack_cell_size(1920, 1080);
+    assert_eq!(
+        super::terminal_geometry::device_cell_size(reported, 80, 32, (12, 28)),
+        (24, 33),
+        "an 80x32 grid across 1920x1080 painted pixels is 24x33 px per cell"
+    );
+    assert_eq!(
+        super::terminal_geometry::device_cell_size(0, 80, 32, (12, 28)),
+        (12, 28),
+        "before the host answers, the reported cell size is kept"
+    );
+    assert_eq!(
+        super::terminal_geometry::device_cell_size(
+            super::terminal_geometry::pack_cell_size(1920, 1080),
+            0,
+            32,
+            (12, 28)
+        ),
+        (12, 28),
+        "an unknown grid cannot divide the extent"
+    );
+}
+
+#[test]
 fn reported_cell_size_is_taken_from_host_cell_size_events() {
     let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[?997;1n");
     assert_eq!(

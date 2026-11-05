@@ -97,6 +97,13 @@ pub enum RawInputEvent {
         width_px: u32,
         height_px: u32,
     },
+    // The screen extent in device pixels from `CSI 15 ; height ; width t`.
+    // The dimensions are only read by the Unix client.
+    #[cfg_attr(not(any(unix, test)), allow(dead_code))]
+    HostScreenPixelsReport {
+        width_px: u32,
+        height_px: u32,
+    },
     Unsupported,
 }
 
@@ -348,7 +355,8 @@ impl RawInputByteFramer {
     }
 
     /// Same hold window as `host_color_query_sent`, for the XTWINOPS cell size
-    /// reply. Only the Unix client sends this query.
+    /// and screen pixel replies. Only the Unix client sends these queries, and
+    /// one counter tracks both because they are always sent together.
     #[cfg(any(unix, test))]
     pub(crate) fn host_cell_size_query_sent(&mut self) {
         self.host_cell_size_replies_awaited = HOST_CELL_SIZE_QUERY_REPLIES;
@@ -631,7 +639,8 @@ impl RawInputByteFramer {
         }
 
         if self.host_cell_size_replies_awaited > 0
-            && starts_with_incomplete_host_cell_size_report(&self.buffer)
+            && (starts_with_incomplete_host_cell_size_report(&self.buffer)
+                || starts_with_incomplete_host_screen_pixels_report(&self.buffer))
         {
             tracing::debug!(
                 len = self.buffer.len(),
@@ -868,7 +877,11 @@ impl RawInputByteFramer {
                 RawInputEvent::HostDefaultColor { .. } | RawInputEvent::HostPaletteColors { .. }
             ) {
                 self.host_color_replies_awaited = self.host_color_replies_awaited.saturating_sub(1);
-            } else if matches!(event, RawInputEvent::HostCellSizeReport { .. }) {
+            } else if matches!(
+                event,
+                RawInputEvent::HostCellSizeReport { .. }
+                    | RawInputEvent::HostScreenPixelsReport { .. }
+            ) {
                 self.host_cell_size_replies_awaited =
                     self.host_cell_size_replies_awaited.saturating_sub(1);
             } else if self.host_appearance_query_on_focus
@@ -1061,6 +1074,16 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
             ));
         }
 
+        if let Some((width_px, height_px)) = parse_host_screen_pixels_report(&buffer[..seq_len]) {
+            return Some((
+                RawInputEvent::HostScreenPixelsReport {
+                    width_px,
+                    height_px,
+                },
+                seq_len,
+            ));
+        }
+
         if let Some(mouse) = parse_sgr_mouse(seq) {
             return Some((RawInputEvent::Mouse(mouse), seq_len));
         }
@@ -1113,10 +1136,24 @@ fn parse_host_color_scheme_report(buffer: &[u8]) -> Option<HostAppearance> {
 /// Parses an XTWINOPS cell size report (`CSI 6 ; height ; width t`) into
 /// `(width_px, height_px)`; note the reply orders height first.
 fn parse_host_cell_size_report(buffer: &[u8]) -> Option<(u32, u32)> {
+    let (height_px, width_px) = parse_screen_size_report(buffer, b"6")?;
+    Some((width_px, height_px))
+}
+
+/// Parses the XTWINOPS screen pixel extent report (`CSI 15 ; height ; width t`)
+/// into `(width_px, height_px)`. Terminals answer this in the pixel space they
+/// paint in, which is not the cell space `CSI 6 ; h ; w t` reports on scaled
+/// displays.
+fn parse_host_screen_pixels_report(buffer: &[u8]) -> Option<(u32, u32)> {
+    let (height_px, width_px) = parse_screen_size_report(buffer, b"15")?;
+    Some((width_px, height_px))
+}
+
+fn parse_screen_size_report(buffer: &[u8], kind: &[u8]) -> Option<(u32, u32)> {
     let body = buffer.strip_prefix(b"\x1b[")?.strip_suffix(b"t")?;
     let text = std::str::from_utf8(body).ok()?;
     let mut params = text.split(';');
-    if params.next()? != "6" {
+    if params.next()?.as_bytes() != kind {
         return None;
     }
     let height_px = params.next()?.parse::<u32>().ok()?;
@@ -1124,7 +1161,7 @@ fn parse_host_cell_size_report(buffer: &[u8]) -> Option<(u32, u32)> {
     if params.next().is_some() || width_px == 0 || height_px == 0 {
         return None;
     }
-    Some((width_px, height_px))
+    Some((height_px, width_px))
 }
 
 fn starts_with_incomplete_default_color_response(buffer: &[u8]) -> bool {
@@ -1160,6 +1197,14 @@ fn starts_with_incomplete_host_color_scheme_report(buffer: &[u8]) -> bool {
 }
 
 fn starts_with_incomplete_host_cell_size_report(buffer: &[u8]) -> bool {
+    starts_with_incomplete_screen_size_report(buffer, b"6")
+}
+
+fn starts_with_incomplete_host_screen_pixels_report(buffer: &[u8]) -> bool {
+    starts_with_incomplete_screen_size_report(buffer, b"15")
+}
+
+fn starts_with_incomplete_screen_size_report(buffer: &[u8], kind: &[u8]) -> bool {
     let Some(body) = buffer.strip_prefix(b"\x1b[") else {
         return false;
     };
@@ -1168,7 +1213,7 @@ fn starts_with_incomplete_host_cell_size_report(buffer: &[u8]) -> bool {
     }
 
     let mut params = body.split(|byte| *byte == b';');
-    if params.next() != Some(b"6".as_slice()) {
+    if params.next() != Some(kind) {
         return false;
     }
     let height = params.next();
@@ -1185,6 +1230,7 @@ fn is_host_reply_event(event: &RawInputEvent) -> bool {
         RawInputEvent::HostDefaultColor { .. }
             | RawInputEvent::HostPaletteColors { .. }
             | RawInputEvent::HostCellSizeReport { .. }
+            | RawInputEvent::HostScreenPixelsReport { .. }
             | RawInputEvent::HostColorSchemeChanged(_)
     )
 }
@@ -1642,6 +1688,30 @@ mod tests {
         };
         assert_eq!(key.code, code);
         assert_eq!(key.modifiers, modifiers);
+    }
+
+    #[test]
+    fn parses_host_screen_pixels_separately_from_the_cell_size_report() {
+        assert_eq!(
+            parse_host_screen_pixels_report(b"\x1b[15;1080;1920t"),
+            Some((1920, 1080)),
+            "the screen extent reply orders height first and reports painted pixels"
+        );
+        assert_eq!(
+            parse_host_cell_size_report(b"\x1b[6;28;12t"),
+            Some((12, 28)),
+            "the cell size reply keeps its own meaning"
+        );
+        assert_eq!(
+            parse_host_screen_pixels_report(b"\x1b[6;28;12t"),
+            None,
+            "a cell size reply is never read as a screen extent"
+        );
+        assert_eq!(
+            parse_host_screen_pixels_report(b"\x1b[15;0;1920t"),
+            None,
+            "a zero extent is not a geometry"
+        );
     }
 
     fn decode_hex(hex: &str) -> Vec<u8> {
