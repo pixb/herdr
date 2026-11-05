@@ -3,15 +3,20 @@
 //! This is the output-side counterpart to `decode`. It converts RGBA image bytes
 //! into a canonical DEC Sixel frame:
 //!
-//! * the P1 header uses the 16-parameter layout real terminals read
-//!   (`Pmacro;Pbgmode;Phgrid;…`), with a transparent background,
-//! * the raster attributes declare the frame size with DECGRA (`"1;1;H;W`),
+//! * the P1 header uses the 12-parameter DEC layout terminals parse, with the
+//!   grid, the aspect ratio overrides and the graphic rectangle left neutral,
+//!   and a transparent background,
+//! * the raster attributes declare the frame size with DECGRA (`"1;1;W;H`),
 //! * every colour the frame paints is defined with explicit percent RGB
 //!   (`#Pc;2;R;G;B`) before it is selected, because a terminal's Sixel palette
 //!   is not guaranteed to contain the DEC 6x6x6 cube: Foot preloads only the
 //!   16 theme colours, and xterm wraps register numbers by its register count,
 //! * Raster Graphics uses ASCII band characters `? ! " # $ % &`, and RLE encodes
 //!   runs as `char` for runs of 1-3 and `!` `run` `char` for runs of 4+,
+//! * a band line never contains a space: foot and xterm ignore one without
+//!   moving the graphics pen, which folds the columns after a gap onto the
+//!   columns before it, so gaps are painted with the background register the
+//!   P1 header declares transparent,
 //! * the frame closes with the DCS string terminator. Sixel has no image-delete
 //!   sequence, so no erasure is emitted; the caller repaints the covered cells.
 //!
@@ -128,36 +133,49 @@ pub fn encode_band(
     }
 }
 
-/// Encodes one colour's band line in canonical RLE: each column's mask byte (bit
-/// `y` = row `band * 6 + y`) maps to the band character `mask + 0x3f`, unpainted
-/// runs are spaces that advance the pen, and runs of 4+ identical masks collapse
-/// to `!` `count` `char`. Trailing empty columns are dropped, keeping the frame
-/// compact.
-pub fn rle_band_line(mask: &[u8], width: usize) -> Vec<u8> {
+fn push_rle(out: &mut Vec<u8>, run: usize, ch: u8) {
+    if run >= 4 {
+        out.push(b'!');
+        out.extend(run.to_string().into_bytes());
+        out.push(ch);
+    } else {
+        for _ in 0..run {
+            out.push(ch);
+        }
+    }
+}
+
+/// Encodes one colour's band line: each column's mask byte (bit `y` = row
+/// `band * 6 + y`) maps to the band character `mask + 0x3f`, runs of 4+
+/// identical masks collapse to `!` `count` `char`, and the line selects the
+/// registers it paints.
+///
+/// Columns the colour does not paint are filled with the background register,
+/// which the frame declares transparent in the P1 header. They are never left
+/// as spaces: foot's and xterm's decoders ignore a space without moving the
+/// graphics pen, so a space gap folds the columns after it back onto the
+/// columns before it. Trailing gaps are dropped, keeping the frame compact.
+pub fn color_band_line(register: usize, mask: &[u8], width: usize) -> Vec<u8> {
+    let Some(last) = mask[..width].iter().rposition(|m| *m != 0) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
+    let mut selected: Option<usize> = None;
     let mut i = 0;
-    while i < width {
+    while i <= last {
         let mask_byte = mask[i];
         let mut run = 1;
-        while i + run < width && mask[i + run] == mask_byte {
+        while i + run <= last && mask[i + run] == mask_byte {
             run += 1;
         }
-        if mask_byte == 0 {
-            out.extend(std::iter::repeat_n(b' ', run));
-        } else if run >= 4 {
-            out.push(b'!');
-            out.extend(run.to_string().into_bytes());
-            out.push(mask_byte + 0x3f);
-        } else {
-            for _ in 0..run {
-                out.push(mask_byte + 0x3f);
-            }
+        let target = if mask_byte == 0 { 0 } else { register };
+        if selected != Some(target) {
+            out.push(b'#');
+            out.extend(target.to_string().into_bytes());
+            selected = Some(target);
         }
+        push_rle(&mut out, run, mask_byte + 0x3f);
         i += run;
-    }
-    let last = out.iter().rposition(|b| *b != b' ');
-    if let Some(last) = last {
-        out.truncate(last + 1);
     }
     out
 }
@@ -201,13 +219,11 @@ fn encode_body(indexed: &[usize], width: usize, height: usize) -> Vec<u8> {
         let mut lines = Vec::new();
         encode_band(indexed, width, height, band, &mut lines);
         for (idx, mask) in lines {
-            let line = rle_band_line(&mask, width);
+            let line = color_band_line(idx, &mask, width);
             if line.is_empty() {
                 continue;
             }
             painted = true;
-            body.push(b'#');
-            body.extend(idx.to_string().into_bytes());
             body.extend(line);
             body.push(b'$');
         }
@@ -219,17 +235,27 @@ fn encode_body(indexed: &[usize], width: usize, height: usize) -> Vec<u8> {
     body
 }
 
-/// The 16-parameter P1 header, matching the layout libsixel emits. Terminals
-/// read only the first three (`Pmacro`, `Pbgmode`, `Phgrid`) and ignore the rest,
-/// so the pane size fields are informational.
-fn frame_header(width: usize, height: usize) -> Vec<u8> {
-    format!("\x1bP0;1;0;1;1;{width};{height};0;{width};{height};0;0;0;0;1;1q").into_bytes()
+/// The P1 header in the layout terminals actually parse: the DEC 12-parameter
+/// form `Pmacro;Pbgmode;Phgrid;Pvgrid;Pheight;Pwidth;Pheight_size;Pwidth_size;
+/// Pleft;Ptop;Preduce;Pcenter`.
+///
+/// Foot reads only the first three parameters (`dcs.c`); xterm reads all twelve
+/// and uses slots 3 and 4 as a *grid* that the image is scaled to fit, slots 5
+/// and 6 as the pixel aspect ratio, and slots 7..10 as a declared graphic
+/// rectangle. The grid, the aspect overrides and the rectangle are therefore all
+/// left neutral here, and the frame size is declared once by DECGRA.
+fn frame_header() -> Vec<u8> {
+    // Pmacro 0: terminal default aspect; Pbgmode 1: transparent background, so
+    // the pane's own background stays visible under unpainted pixels.
+    b"\x1bP0;1;0;0;1;1;0;0;0;0;0;0q".to_vec()
 }
 
-/// DECGRA raster attributes: `PAN;PAD;V;H` with square pixels and the declared
-/// vertical and horizontal extents.
+/// DECGRA raster attributes: `PAN;PAD;W;H` with square pixels and the declared
+/// width before the declared height. Foot, xterm and libsixel all read the
+/// extent that way; declaring them the other way round stretches the image into
+/// a transposed rectangle. `PAD == 1` keeps foot on its 1:1 put handler.
 fn raster_attributes(width: usize, height: usize) -> Vec<u8> {
-    format!("\"1;1;{height};{width}").into_bytes()
+    format!("\"1;1;{width};{height}").into_bytes()
 }
 
 /// Encodes `src` scaled to `dst_width` by `dst_height` as one self-contained
@@ -252,7 +278,7 @@ pub fn encode_frame(
     if body.is_empty() {
         return Vec::new();
     }
-    let mut out = frame_header(dst_width, dst_height);
+    let mut out = frame_header();
     out.extend(raster_attributes(dst_width, dst_height));
     out.extend(color_definitions(&used_registers(&indexed)));
     out.extend(body);
@@ -278,21 +304,29 @@ mod tests {
         v
     }
 
-    /// Prints the encoded frame and decoded pixels for manual inspection.
-    /// Quiet by default; run with `HERDR_SIXEL_DUMP=1` to dump.
+    /// Prints the encoded frame for manual inspection on a real terminal.
+    /// Quiet by default; run with `HERDR_SIXEL_DUMP=1` for the 24x12 frame, or
+    /// `HERDR_SIXEL_DUMP=WIDTHxHEIGHT` for a frame of that pixel size.
     #[test]
     fn debug_dump() {
-        if std::env::var_os("HERDR_SIXEL_DUMP").is_none() {
+        let Some(spec) = std::env::var_os("HERDR_SIXEL_DUMP") else {
             return;
-        }
-        let rgba = rgba_pattern(24, 12);
-        let payload = encode_frame(&rgba, 24, 12, 24, 12);
-        let decoded = decode_sixel(&payload, 12, None).unwrap();
+        };
+        let spec = spec.to_string_lossy().to_string();
+        let (width, height): (usize, u32) = match spec.split_once('x') {
+            Some((w, h)) => (w.parse().unwrap_or(24), h.parse().unwrap_or(12)),
+            None => (24, 12),
+        };
+        let height = height as usize;
+        let rgba = rgba_pattern(width, height);
+        let payload = encode_frame(&rgba, width, height, width, height);
         println!("payload: {}", String::from_utf8_lossy(&payload));
-        for y in 0..12 {
+
+        let decoded = decode_sixel(&payload, height as u32, None).unwrap();
+        for y in 0..height {
             let mut row = Vec::new();
-            for x in 0..24 {
-                let i = (y * 24 + x) * 4;
+            for x in 0..width {
+                let i = (y * width + x) * 4;
                 row.push([decoded.rgba[i], decoded.rgba[i + 1], decoded.rgba[i + 2]]);
             }
             println!("{y} {row:?}");
@@ -348,14 +382,30 @@ mod tests {
         );
 
         let fields = header_fields(&payload);
-        assert_eq!(fields.len(), 16, "the P1 header has 16 parameters");
-        assert_eq!(fields[0], "0", "Pmacro: the default aspect macro");
+        assert_eq!(
+            fields.len(),
+            12,
+            "the P1 header uses the 12-parameter DEC layout terminals parse"
+        );
+        assert_eq!(fields[0], "0", "Pmacro: the terminal default aspect");
         assert_eq!(
             fields[1], "1",
-            "Pbgmode: transparent background keeps pane background visible"
+            "Pbgmode: transparent background keeps the pane background visible"
         );
-        assert_eq!(fields[5], "12", "the declared pane width");
-        assert_eq!(fields[6], "12", "the declared pane height");
+        assert_eq!(
+            fields[2], "0",
+            "Phgrid: no grid, so the image is never scaled to fit cells"
+        );
+        assert_eq!(fields[3], "0", "Pvgrid: no grid");
+        assert_eq!(fields[4], "1", "Pheight: square pixels");
+        assert_eq!(fields[5], "1", "Pwidth: square pixels");
+        assert_eq!(
+            fields[6], "0",
+            "Pheight_size: no declared graphic rectangle"
+        );
+        assert_eq!(fields[7], "0", "Pwidth_size: no declared graphic rectangle");
+        assert_eq!(fields[8], "0", "Pleft: no declared graphic rectangle");
+        assert_eq!(fields[9], "0", "Ptop: no declared graphic rectangle");
 
         let body = String::from_utf8_lossy(&payload);
         assert!(
@@ -371,15 +421,16 @@ mod tests {
                 g as usize * 100 / 255,
                 b as usize * 100 / 255
             );
-            assert!(
-                body.contains(&definition),
-                "register {register} is defined with explicit RGB: {body}"
+            assert_eq!(
+                body.matches(&definition).count(),
+                1,
+                "register {register} is defined with explicit RGB exactly once: {body}"
             );
         }
-        assert_eq!(
-            body.matches('#').count(),
-            registers.len() + body.matches('$').count(),
-            "every register is defined once, and every painted line selects one and ends with `$`"
+        let selects = body.bytes().filter(|b| *b == b'#').count() - registers.len();
+        assert!(
+            selects >= body.matches('$').count(),
+            "every painted line selects the register it paints: {body}"
         );
     }
 
@@ -390,8 +441,8 @@ mod tests {
         encode_band(&indexed, 10, 6, 0, &mut lines);
         assert_eq!(lines.len(), 1, "one colour covers the band");
         assert_eq!(
-            String::from_utf8(rle_band_line(&lines[0].1, 10)).unwrap(),
-            "!10~",
+            String::from_utf8(color_band_line(17, &lines[0].1, 10)).unwrap(),
+            "#17!10~",
             "the six-row band character is 0x7e and runs above 3 collapse"
         );
         let mut mask = vec![0u8; 10];
@@ -399,9 +450,128 @@ mod tests {
         mask[1] = 1;
         mask[2] = 0;
         assert_eq!(
-            String::from_utf8(rle_band_line(&mask, 10)).unwrap(),
-            "@@",
-            "runs below four repeat the band character, empty columns advance the pen"
+            String::from_utf8(color_band_line(9, &mask, 10)).unwrap(),
+            "#9@@",
+            "runs below four repeat the band character and trailing gaps are dropped"
+        );
+    }
+
+    #[test]
+    fn an_interior_gap_advances_the_pen_with_the_background_register() {
+        let mut mask = vec![0u8; 10];
+        mask[0] = 1;
+        mask[1] = 1;
+        mask[8] = 1;
+        mask[9] = 1;
+        let line = String::from_utf8(color_band_line(5, &mask, 10)).unwrap();
+        assert_eq!(line, "#5@@#0!6?#5@@");
+        assert!(
+            !line.contains(' '),
+            "a decoder that ignores spaces must still advance the pen"
+        );
+        assert_eq!(
+            band_line_columns(&line),
+            10,
+            "the painted columns land where the raster has them: {line}"
+        );
+    }
+
+    /// Counts the columns a band line moves the graphics pen across, the way a
+    /// decoder that ignores everything but band characters sees them.
+    fn band_line_columns(line: &str) -> usize {
+        let bytes = line.as_bytes();
+        let mut columns = 0usize;
+        let mut i = 0usize;
+        let mut first_column = None;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'#' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                b'!' => {
+                    i += 1;
+                    let mut run = 0usize;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        run = run * 10 + usize::from(bytes[i] - b'0');
+                        i += 1;
+                    }
+                    let painted = bytes.get(i).copied().unwrap_or(b'?') != b'?';
+                    if painted {
+                        first_column.get_or_insert(columns);
+                    }
+                    columns += run;
+                    i += 1;
+                }
+                b'?'..=b'~' => {
+                    if bytes[i] != b'?' {
+                        first_column.get_or_insert(columns);
+                    }
+                    columns += 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        first_column.map_or(0, |first| columns - first)
+    }
+
+    #[test]
+    fn every_band_line_covers_its_painted_width() {
+        let rgba = rgba_pattern(37, 18);
+        let payload = encode_frame(&rgba, 37, 18, 37, 18);
+        let text = String::from_utf8_lossy(&payload);
+        let body = &text[text.rfind('"').expect("decstra") + 1..];
+        let mut checked = 0usize;
+        for line in body.split(['-', '$']) {
+            let line = line.trim_start_matches('\'');
+            if line.is_empty() {
+                continue;
+            }
+            let columns = band_line_columns(line);
+            assert!(
+                columns > 0 && columns <= 37,
+                "a band line stays inside the declared raster: {line}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "the frame has band lines: {text}");
+    }
+
+    #[test]
+    fn encoded_frames_contain_no_space_gaps() {
+        let rgba = rgba_pattern(30, 12);
+        let payload = encode_frame(&rgba, 30, 12, 20, 10);
+        assert!(payload.windows(2).any(|w| w == b"\x1bP"));
+        assert!(
+            !payload.contains(&b' '),
+            "{}",
+            String::from_utf8_lossy(&payload)
+        );
+    }
+
+    /// Drops every space from a frame, the way foot and xterm read them: their
+    /// Sixel handlers ignore a space without moving the graphics pen, so a
+    /// decoder fed this stream is stricter than one that honours the skip.
+    fn without_spaces(payload: &[u8]) -> Vec<u8> {
+        payload.iter().copied().filter(|b| *b != b' ').collect()
+    }
+
+    #[test]
+    fn frames_survive_a_decoder_that_ignores_spaces() {
+        let rgba = rgba_pattern(24, 12);
+        let payload = encode_frame(&rgba, 24, 12, 24, 12);
+        let strict = decode_sixel(&without_spaces(&payload), 12, None).expect("decode frame");
+        let lenient = decode_sixel(&payload, 12, None).expect("decode frame");
+        assert_eq!(
+            strict.width, lenient.width,
+            "ignoring the space gaps must not fold the image narrower"
+        );
+        assert_eq!(
+            strict.rgba, lenient.rgba,
+            "the pen lands on the same columns with or without the gaps"
         );
     }
 
@@ -448,6 +618,21 @@ mod tests {
         assert!(
             body.matches('@').count() == 1,
             "the painted band emits exactly one band character: {body}"
+        );
+    }
+
+    #[test]
+    fn decgra_declares_the_width_before_the_height() {
+        let rgba = rgba_pattern(20, 6);
+        let payload = encode_frame(&rgba, 20, 6, 20, 6);
+        let body = String::from_utf8_lossy(&payload);
+        assert!(
+            body.contains("\"1;1;20;6"),
+            "a non-square frame declares width then height, the order Foot, xterm and libsixel read: {body}"
+        );
+        assert!(
+            !body.contains("\"1;1;6;20"),
+            "the extent is never declared height first, which stretches the image into a transposed rectangle: {body}"
         );
     }
 
