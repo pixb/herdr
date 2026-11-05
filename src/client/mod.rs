@@ -68,12 +68,16 @@ use terminal_geometry::{
     resize_report_required, should_query_host_cell_size, write_host_cell_size_query,
     write_host_terminal_appearance_query, write_host_terminal_theme_query,
 };
+#[cfg(unix)]
+use terminal_geometry::{
+    device_cell_size, reported_cell_size_from_events, reported_screen_pixels_from_events,
+    store_reported_cell_size, store_reported_screen_pixels,
+};
 use terminal_geometry::{
     host_cell_size_query_required, initial_terminal_geometry, query_host_cell_size,
-    query_host_terminal_theme, resize_poll_loop,
+    query_host_screen_pixels, query_host_terminal_theme, resize_poll_loop,
+    screen_pixels_query_required,
 };
-#[cfg(unix)]
-use terminal_geometry::{reported_cell_size_from_events, store_reported_cell_size};
 use terminal_setup::{
     effective_mouse_capture, effective_sgr_pixel_mouse, set_mouse_capture,
     setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor, TerminalGuard,
@@ -175,6 +179,40 @@ fn needs_host_pixel_geometry(kitty_graphics_enabled: bool) -> bool {
             crate::kitty_graphics::host_graphics(),
             crate::kitty_graphics::HostGraphics::Sixel
         )
+}
+
+/// Sizes host-painted graphics with the cell pitch the terminal composites in.
+///
+/// The resize path already carries the cell size the terminal reports for text
+/// layout; painted rasters land in device pixels, so once the host answers
+/// `CSI 15 ; height ; width t` the per-cell pitch is derived from that extent.
+/// Before any answer arrives this keeps the reported cell size unchanged.
+#[cfg(unix)]
+fn apply_painted_cell_size(
+    state: &mut ClientState,
+    reported_screen_pixels: &AtomicU64,
+    fallback: (u32, u32),
+) {
+    let (width_px, height_px) = device_cell_size(
+        reported_screen_pixels.load(Ordering::Acquire),
+        u32::from(state.reported_size.0),
+        u32::from(state.reported_size.1),
+        fallback,
+    );
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_graphics_cell_size(width_px, height_px);
+    }
+}
+
+#[cfg(windows)]
+fn apply_painted_cell_size(
+    state: &mut ClientState,
+    _reported_screen_pixels: &AtomicU64,
+    fallback: (u32, u32),
+) {
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_graphics_cell_size(fallback.0, fallback.1);
+    }
 }
 
 fn negotiated_surface_decoder(
@@ -547,6 +585,9 @@ async fn run_client_loop(
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
     let reported_cell_size = Arc::new(AtomicU64::new(0));
+    // Screen extent reported by the host terminal in painted pixels, packed the
+    // same way. Zero means the host has not reported one.
+    let reported_screen_pixels = Arc::new(AtomicU64::new(0));
     let host_sgr_pixels_active = Arc::new(AtomicBool::new(false));
 
     // Channel for events from the resize and server reader threads.
@@ -569,6 +610,8 @@ async fn run_client_loop(
     // host terminal directly instead of falling back to an assumed cell size.
     let will_query_host_cell_size = state.attach_escape.is_none()
         && host_cell_size_query_required(needs_host_pixel_geometry(state.kitty_graphics_enabled));
+    let will_query_host_screen_pixels = state.attach_escape.is_none()
+        && screen_pixels_query_required(needs_host_pixel_geometry(state.kitty_graphics_enabled));
     let stdin_quit = should_quit.clone();
     let stdin_mouse_capture_active = host_mouse_capture_active.clone();
     let stdin_sgr_pixels_active = host_sgr_pixels_active.clone();
@@ -587,7 +630,7 @@ async fn run_client_loop(
             &stdin_quit,
             will_query_host_terminal_theme,
             stdin_host_theme_query_pending,
-            will_query_host_cell_size,
+            will_query_host_cell_size || will_query_host_screen_pixels,
             stdin_mouse_capture_active,
             stdin_sgr_pixels_active,
             stdin_escape_disambiguation_active,
@@ -609,6 +652,10 @@ async fn run_client_loop(
 
     if will_query_host_cell_size {
         query_host_cell_size();
+    }
+
+    if will_query_host_screen_pixels {
+        query_host_screen_pixels();
     }
 
     // Spawn the resize poller thread.
@@ -882,6 +929,21 @@ async fn run_client_loop(
                         {
                             store_reported_cell_size(&reported_cell_size, width_px, height_px);
                         }
+                        if let Some((width_px, height_px)) =
+                            reported_screen_pixels_from_events(&events)
+                        {
+                            store_reported_screen_pixels(
+                                &reported_screen_pixels,
+                                width_px,
+                                height_px,
+                            );
+                            let fallback_cell_size = state.reported_cell_size;
+                            apply_painted_cell_size(
+                                &mut state,
+                                &reported_screen_pixels,
+                                fallback_cell_size,
+                            );
+                        }
                     }
                     let image_target = state
                         .shell
@@ -1024,6 +1086,16 @@ async fn run_client_loop(
                     }
                     if let Some((width_px, height_px)) = reported_cell_size_from_events(&events) {
                         store_reported_cell_size(&reported_cell_size, width_px, height_px);
+                    }
+                    if let Some((width_px, height_px)) = reported_screen_pixels_from_events(&events)
+                    {
+                        store_reported_screen_pixels(&reported_screen_pixels, width_px, height_px);
+                        let fallback_cell_size = state.reported_cell_size;
+                        apply_painted_cell_size(
+                            &mut state,
+                            &reported_screen_pixels,
+                            fallback_cell_size,
+                        );
                     }
                     data
                 };
@@ -1338,9 +1410,13 @@ async fn run_client_loop(
                 // Resizing invalidates both the host-side blit baseline and pane hit geometry.
                 state.request_repaint();
                 if let Some(shell) = state.shell.as_mut() {
-                    shell.set_graphics_cell_size(cell_width_px, cell_height_px);
                     shell.invalidate_pane_surface();
                 }
+                apply_painted_cell_size(
+                    &mut state,
+                    &reported_screen_pixels,
+                    (cell_width_px, cell_height_px),
+                );
                 let msg = if let Some(shell) = &state.shell {
                     client_shell_resize_message(
                         shell,
