@@ -4098,6 +4098,46 @@ mod tests {
     use std::ffi::OsStr;
 
     #[tokio::test]
+    async fn a_child_kitty_transmission_becomes_a_placement_not_grid_text() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        // A previewer such as chafa transmits the 7-bit form: `ESC _ G` metadata,
+        // base64 payload, string terminator. Host-side Sixel painting must not
+        // rewrite that introducer, because the VT core recognizes it there.
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==")
+            .expect("test png");
+        let payload = STANDARD.encode(&png);
+        let frame = format!(
+            "image:\x1b_Ga=T,f=100,s={},v={},c=4,r=2,q=2,m=0;{payload}\x1b\\",
+            png.len(),
+            png.len()
+        );
+
+        crate::kitty_graphics::set_enabled(true);
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"prompt");
+        runtime.test_process_pty_bytes(frame.as_bytes());
+
+        assert!(
+            runtime.kitty_graphics_may_have_placements(),
+            "the transmission reached the graphics parser"
+        );
+        let text = runtime.detection_text();
+        assert!(
+            !text.contains("a=T") && !text.contains(&payload),
+            "the transmission stayed out of the grid: {text}"
+        );
+        assert!(
+            text.contains("image:"),
+            "surrounding text is still drawn: {text}"
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+
+    #[tokio::test]
     async fn unidentified_text_cache_tracks_runtime_mutations_not_viewport_scroll() {
         let runtime = PaneRuntime::test_with_scrollback_bytes(
             12,
