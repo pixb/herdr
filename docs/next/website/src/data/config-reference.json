@@ -446,6 +446,27 @@
           "type": "boolean",
           "default": "true",
           "description": "Render pane images in Kitty graphics-compatible outer terminals. Applications use the standard Kitty graphics protocol through pane terminal output; the external socket pane-overlay API is no longer available. Set false to disable graphics rendering. Restart the server or reattach the client after changing it. In remote sessions, server configuration controls Kitty graphics parsing while local client configuration controls outer-terminal output."
+        },
+        {
+          "key": "terminal.sixel",
+          "type": "enum",
+          "default": "\"auto\"",
+          "description": "How Sixel raster graphics emitted by pane applications are handled. auto relays Sixel only when the outer terminal reports Sixel support in its device attributes, on always relays, off leaves the bytes untouched. A relayed frame is decoded by Herdr and shown through the same image pipeline as Kitty graphics, so placement, clipping, and cleanup follow the Kitty path. Restart the server or reattach the client after changing it.",
+          "values": [
+            "auto",
+            "on",
+            "off"
+          ]
+        },
+        {
+          "key": "terminal.host_graphics",
+          "type": "enum",
+          "default": "\"kitty\"",
+          "description": "Experimental transport Herdr uses to paint pane images on the outer terminal. kitty keeps Kitty graphics placements, which Ghostty, Kitty, and WezTerm render. sixel encodes each image as a Sixel frame at the image's cell position, for outer terminals that render Sixel but not Kitty placements. Sixel has no image-delete sequence, so Herdr paints in Sixel Display Mode so frames overwrite cells instead of scrolling, and requests a full repaint when a frame disappears. Each frame defines its colors with explicit RGB. Restart the server or reattach the client after changing it.",
+          "values": [
+            "kitty",
+            "sixel"
+          ]
         }
       ]
     },

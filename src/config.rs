@@ -23,10 +23,10 @@ pub use self::{
     },
     model::{
         validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig,
-        ShellModeConfig, SidebarCollapsedModeConfig, SixelModeConfig, StatusIndicatorStyle,
-        TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
-        UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        ConfigReloadStatus, HostCursorModeConfig, HostGraphicsConfig, NewTerminalCwdConfig,
+        PaneBordersConfig, ShellModeConfig, SidebarCollapsedModeConfig, SixelModeConfig,
+        StatusIndicatorStyle, TabBarPositionConfig, ToastClipboardPosition, ToastConfig,
+        ToastDelivery, ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -109,6 +109,14 @@ impl Config {
             SixelModeConfig::On => Some(true),
             SixelModeConfig::Off => Some(false),
             SixelModeConfig::Auto => None,
+        }
+    }
+
+    /// Protocol Herdr uses for graphics output on the outer terminal.
+    pub fn host_graphics(&self) -> crate::kitty_graphics::HostGraphics {
+        match self.terminal.host_graphics {
+            HostGraphicsConfig::Kitty => crate::kitty_graphics::HostGraphics::Kitty,
+            HostGraphicsConfig::Sixel => crate::kitty_graphics::HostGraphics::Sixel,
         }
     }
 

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use base64::Engine;
 use ratatui::layout::Rect;
@@ -14,6 +14,7 @@ use crate::layout::PaneId;
 use crate::terminal::TerminalRuntimeRegistry;
 
 pub(crate) mod output;
+pub(crate) mod sixel_surface;
 pub(crate) mod surface;
 
 pub(crate) use output::{GraphicsOperation, GraphicsOutput};
@@ -118,6 +119,41 @@ pub(crate) fn set_enabled(enabled: bool) {
 
 pub(crate) fn is_enabled() -> bool {
     KITTY_GRAPHICS_ENABLED.load(Ordering::Acquire)
+}
+
+/// Protocol Herdr paints pane graphics with on the outer terminal.
+///
+/// `Kitty` keeps the existing placement-based upload path. `Sixel` encodes each
+/// placement as a canonical DEC Sixel frame painted at the placement's cell
+/// origin, which is the only option for outer terminals without Kitty
+/// placement support (Foot, xterm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HostGraphics {
+    #[default]
+    Kitty,
+    Sixel,
+}
+
+const HOST_GRAPHICS_KITTY: u8 = 0;
+const HOST_GRAPHICS_SIXEL: u8 = 1;
+
+static HOST_GRAPHICS_MODE: AtomicU8 = AtomicU8::new(HOST_GRAPHICS_KITTY);
+
+pub(crate) fn set_host_graphics(mode: HostGraphics) {
+    HOST_GRAPHICS_MODE.store(
+        match mode {
+            HostGraphics::Kitty => HOST_GRAPHICS_KITTY,
+            HostGraphics::Sixel => HOST_GRAPHICS_SIXEL,
+        },
+        Ordering::Release,
+    );
+}
+
+pub(crate) fn host_graphics() -> HostGraphics {
+    match HOST_GRAPHICS_MODE.load(Ordering::Acquire) {
+        HOST_GRAPHICS_SIXEL => HostGraphics::Sixel,
+        _ => HostGraphics::Kitty,
+    }
 }
 
 pub(crate) fn image_transfer_estimated_size(data_len: usize) -> usize {

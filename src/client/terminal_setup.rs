@@ -54,6 +54,7 @@ pub(super) fn setup_terminal_with_capabilities(
         reset_modify_other_keys: false,
         modify_other_keys_sequence: None,
         reset_host_color_scheme_reports: false,
+        reset_sixel_display_mode: false,
         restore_claimed: Arc::new(AtomicBool::new(false)),
         restored: false,
         #[cfg(windows)]
@@ -123,6 +124,17 @@ pub(super) fn setup_terminal_with_capabilities(
 
     execute!(io::stdout(), DisableLineWrap)?;
 
+    // Sixel paints over the text cells it covers. Sixel Display Mode (DECSDM)
+    // stops a frame from scrolling the screen, which is the only mode where
+    // painting a pane image at a grid position keeps the layout intact.
+    if enable_client_protocols
+        && crate::kitty_graphics::host_graphics() == crate::kitty_graphics::HostGraphics::Sixel
+    {
+        terminal_guard.reset_sixel_display_mode = true;
+        io::stdout().write_all(b"\x1b[?80h")?;
+        io::stdout().flush()?;
+    }
+
     terminal_guard.host_escape_disambiguation_active = host_probe.escape_disambiguation;
     terminal_guard.host_sgr_pixel_mouse = host_probe.sgr_pixel_mouse;
     terminal_guard.buffered_host_input = buffered_host_input;
@@ -143,6 +155,8 @@ pub(super) struct TerminalGuard {
     /// The modifyOtherKeys sequence written at setup, re-sent on refresh.
     modify_other_keys_sequence: Option<&'static [u8]>,
     reset_host_color_scheme_reports: bool,
+    /// Sixel Display Mode was enabled for sixel host graphics.
+    reset_sixel_display_mode: bool,
     restore_claimed: Arc<AtomicBool>,
     restored: bool,
     #[cfg(windows)]
@@ -677,6 +691,7 @@ fn restore_terminal_state_once(
     reset_keyboard_enhancements: bool,
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
+    reset_sixel_display_mode: bool,
     #[cfg(windows)] restore_windows_input_mode: &WindowsInputModeRestore,
 ) -> io::Result<()> {
     if restore_claimed.swap(true, Ordering::AcqRel) {
@@ -688,6 +703,7 @@ fn restore_terminal_state_once(
         reset_keyboard_enhancements,
         reset_modify_other_keys,
         reset_host_color_scheme_reports,
+        reset_sixel_display_mode,
         #[cfg(windows)]
         restore_windows_input_mode,
     )
@@ -697,10 +713,15 @@ fn restore_terminal_state(
     reset_keyboard_enhancements: bool,
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
+    reset_sixel_display_mode: bool,
     #[cfg(windows)] restore_windows_input_mode: Option<u32>,
 ) -> io::Result<()> {
     let _ = clear_received_kitty_graphics(&mut io::stdout());
 
+    if reset_sixel_display_mode {
+        let _ = io::stdout().write_all(b"\x1b[?80l");
+        let _ = io::stdout().flush();
+    }
     // Reset modifyOtherKeys if we enabled it.
     if reset_modify_other_keys {
         let _ = io::stdout().write_all(b"\x1b[>4;0m");
@@ -872,6 +893,7 @@ impl TerminalGuard {
         let reset_keyboard_enhancements = self.reset_keyboard_enhancements;
         let reset_modify_other_keys = self.reset_modify_other_keys;
         let reset_host_color_scheme_reports = self.reset_host_color_scheme_reports;
+        let reset_sixel_display_mode = self.reset_sixel_display_mode;
         #[cfg(windows)]
         let restore_windows_input_mode = self.restore_windows_input_mode.clone();
         move || {
@@ -880,6 +902,7 @@ impl TerminalGuard {
                 reset_keyboard_enhancements,
                 reset_modify_other_keys,
                 reset_host_color_scheme_reports,
+                reset_sixel_display_mode,
                 #[cfg(windows)]
                 &restore_windows_input_mode,
             );
@@ -893,6 +916,7 @@ impl TerminalGuard {
             self.reset_keyboard_enhancements,
             self.reset_modify_other_keys,
             self.reset_host_color_scheme_reports,
+            self.reset_sixel_display_mode,
             #[cfg(windows)]
             &self.restore_windows_input_mode,
         )
@@ -907,6 +931,7 @@ impl Drop for TerminalGuard {
                 self.reset_keyboard_enhancements,
                 self.reset_modify_other_keys,
                 self.reset_host_color_scheme_reports,
+                self.reset_sixel_display_mode,
                 #[cfg(windows)]
                 &self.restore_windows_input_mode,
             );
@@ -991,6 +1016,7 @@ mod tests {
             reset_modify_other_keys: modify_other_keys_sequence.is_some(),
             modify_other_keys_sequence,
             reset_host_color_scheme_reports: false,
+            reset_sixel_display_mode: false,
             restore_claimed: Arc::new(AtomicBool::new(false)),
             // Keep Drop from writing restore sequences to the test's stdout.
             restored: true,

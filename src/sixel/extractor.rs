@@ -251,7 +251,9 @@ pub(crate) fn classify_clear(bytes: &[u8]) -> Option<ClearKind> {
     let mut saw_digit = false;
     for &byte in body {
         if byte.is_ascii_digit() {
-            current = current.saturating_mul(10).saturating_add(u32::from(byte - b'0'));
+            current = current
+                .saturating_mul(10)
+                .saturating_add(u32::from(byte - b'0'));
             saw_digit = true;
         } else if byte == b';' {
             last_number = Some(current);

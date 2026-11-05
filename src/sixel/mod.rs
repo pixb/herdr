@@ -20,6 +20,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 pub(crate) mod decode;
+pub(crate) mod encode;
 pub(crate) mod extractor;
 pub(crate) mod forward;
 

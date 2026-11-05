@@ -206,6 +206,7 @@ fn run_client_with_mode(
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
+    crate::kitty_graphics::set_host_graphics(loaded_config.config.host_graphics());
     let kitty_graphics_enabled =
         loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
     let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();

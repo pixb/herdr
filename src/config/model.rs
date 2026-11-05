@@ -264,6 +264,19 @@ pub struct TerminalConfig {
     /// `auto` forwards Sixel only when the outer terminal reports Sixel
     /// support; `on`/`off` force it. Default: auto.
     pub sixel: SixelModeConfig,
+    /// Protocol Herdr uses for graphics output on the outer terminal.
+    /// `kitty` keeps placement uploads (Kitty, WezTerm, GPW); `sixel` paints each
+    /// placement as a DEC Sixel frame at its cell origin, for terminals such as
+    /// Foot that support Sixel but not Kitty placements. Default: kitty.
+    pub host_graphics: HostGraphicsConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostGraphicsConfig {
+    #[default]
+    Kitty,
+    Sixel,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -2065,6 +2078,21 @@ kitty_graphics = false
         )
         .unwrap();
         assert!(!config.kitty_graphics_enabled());
+    }
+
+    #[test]
+    fn host_graphics_defaults_to_kitty_and_parses_sixel() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.terminal.host_graphics, HostGraphicsConfig::Kitty);
+
+        let sixel: Config = toml::from_str(
+            r#"
+[terminal]
+host_graphics = "sixel"
+"#,
+        )
+        .unwrap();
+        assert_eq!(sixel.terminal.host_graphics, HostGraphicsConfig::Sixel);
     }
 
     #[test]

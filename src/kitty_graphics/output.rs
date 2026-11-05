@@ -12,6 +12,10 @@ pub(crate) enum GraphicsOperation {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GraphicsOutput {
     pub(crate) operations: Vec<GraphicsOperation>,
+    /// The client must repaint every cell on the next frame. Sixel output has no
+    /// erase sequence, so dropping a painted frame can only be fixed by writing
+    /// the covered cells again.
+    pub(crate) repaint_required: bool,
 }
 
 impl GraphicsOutput {
@@ -19,6 +23,18 @@ impl GraphicsOutput {
         let mut output = Self::default();
         output.push_bytes(bytes);
         output
+    }
+
+    pub(crate) fn from_ops(operations: Vec<GraphicsOperation>) -> Self {
+        Self {
+            operations,
+            ..Self::default()
+        }
+    }
+
+    /// Marks that the outer terminal needs a full repaint to clear painted frames.
+    pub(crate) fn require_repaint(&mut self) {
+        self.repaint_required = true;
     }
 
     pub(crate) fn push_bytes(&mut self, bytes: Vec<u8>) {

@@ -26,12 +26,7 @@ fn next_sixel_image_id() -> u32 {
 /// Encode a decoded Sixel image as a pair of Kitty graphics commands placed
 /// at the current cursor position. `cols`/`rows` are the grid-cell size of
 /// the placement.
-fn encode_kitty_commands(
-    image: &DecodedImage,
-    image_id: u32,
-    cols: u32,
-    rows: u32,
-) -> Vec<u8> {
+fn encode_kitty_commands(image: &DecodedImage, image_id: u32, cols: u32, rows: u32) -> Vec<u8> {
     let mut command = Vec::new();
     let control = format!(
         "a=t,t=d,f=32,s={},v={},i={image_id},q=2",
@@ -72,7 +67,11 @@ pub(crate) fn relay_sixel_frame(
     let cols = grid_cells(image.width, cell_width_px);
     let rows = grid_cells(image.height, cell_height_px);
     if cols == 0 || rows == 0 {
-        tracing::debug!(image_width = image.width, image_height = image.height, "sixel: zero grid");
+        tracing::debug!(
+            image_width = image.width,
+            image_height = image.height,
+            "sixel: zero grid"
+        );
         return None;
     }
     let image_id = next_sixel_image_id();
@@ -135,17 +134,13 @@ mod tests {
     fn relay_places_image_into_the_terminal_core() {
         let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
         terminal.enable_kitty_graphics().unwrap();
-        let placed = relay_sixel_frame(
-            &mut terminal,
-            b"#1;100;0;0!20~-\x40",
-            12,
-            10,
-            16,
-            None,
-        );
+        let placed = relay_sixel_frame(&mut terminal, b"#1;100;0;0!20~-\x40", 12, 10, 16, None);
         // Parallel tests consume synthetic IDs from the shared counter, so
         // only the id space base is stable.
-        assert!(placed.is_some_and(|id| id >= SIXEL_IMAGE_ID_BASE), "frame should relay");
+        assert!(
+            placed.is_some_and(|id| id >= SIXEL_IMAGE_ID_BASE),
+            "frame should relay"
+        );
         let placements = terminal.kitty_image_placements().unwrap();
         assert_eq!(placements.len(), 1, "parser should own one placement");
         assert_eq!(placements[0].image_width, 20);

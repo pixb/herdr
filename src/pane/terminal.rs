@@ -284,6 +284,143 @@ fn collect_sixel_segments(core: &mut GhosttyPaneCore, bytes: &[u8]) -> Vec<Sixel
     segments
 }
 
+/// Strip graphics control sequences that the outer terminal shouldn't see
+/// when `host_graphics == Sixel`. Removes:
+/// - Kitty DCS: `ESC P ... ESC \` (or 7-bit `ESC _ ... ESC \`)
+/// - Kitty ESC G: `ESC G ...`
+/// - OSC 1337 (iTerm2 inline images): `ESC ] 1337 ; ... ESC \` / `BEL`
+fn strip_graphics_control_sequences(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let hg = crate::kitty_graphics::host_graphics();
+    let kitty_enabled = crate::kitty_graphics::is_enabled();
+    if hg != crate::kitty_graphics::HostGraphics::Sixel {
+        // The default transport forwards the batch untouched: no copy on the hot path.
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    // When host_graphics == Sixel:
+    // - If kitty_graphics is enabled, VT core parses Kitty graphics (ESC P/ESC G) into placements.
+    //   Convert 7-bit DCS (ESC _) to 8-bit (ESC P) so VT core recognizes them.
+    // - If kitty_graphics is disabled, strip all Kitty graphics sequences (VT core won't parse).
+    // - Always strip OSC 1337 (iTerm2) which VT core doesn't parse.
+    let strip_kitty = !kitty_enabled;
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // ESC P (DCS) or ESC _ (7-bit DCS)
+        if i + 1 < bytes.len() && bytes[i] == 0x1b && (bytes[i + 1] == 0x50 || bytes[i + 1] == 0x5f)
+        {
+            let is_7bit = bytes[i + 1] == 0x5f;
+            // Convert 7-bit DCS to 8-bit for VT core compatibility
+            if is_7bit && kitty_enabled && !strip_kitty {
+                tracing::trace!(i, "converting 7-bit DCS ESC _ to ESC P");
+                out.push(0x1b);
+                out.push(0x50); // ESC P
+                i += 2;
+            } else if strip_kitty {
+                tracing::trace!(i, "stripping DCS sequence");
+                i += 2;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == 0x1b && (bytes[i + 1] == 0x5c || bytes[i + 1] == 0x5d) {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            } else {
+                // Pass through 8-bit DCS as-is
+                out.push(bytes[i]);
+                out.push(bytes[i + 1]);
+                i += 2;
+            }
+            // Copy DCS payload until terminator
+            while i + 1 < bytes.len() {
+                if bytes[i] == 0x1b && (bytes[i + 1] == 0x5c || bytes[i + 1] == 0x5d) {
+                    out.push(bytes[i]);
+                    out.push(bytes[i + 1]);
+                    i += 2;
+                    break;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // ESC G (Kitty graphics data) or ESC _ G (7-bit)
+        if i + 1 < bytes.len() && bytes[i] == 0x1b {
+            let is_7bit_g = bytes[i + 1] == 0x5f && i + 2 < bytes.len() && bytes[i + 2] == 0x47;
+            let is_8bit_g = bytes[i + 1] == 0x47;
+            if (is_7bit_g || is_8bit_g) && kitty_enabled && !strip_kitty {
+                if is_7bit_g {
+                    tracing::trace!(i, "converting 7-bit ESC _ G to ESC G");
+                    out.push(0x1b);
+                    out.push(0x47); // ESC G
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    out.push(bytes[i + 1]);
+                    i += 2;
+                }
+                // Copy payload until terminator
+                while i + 1 < bytes.len() {
+                    if bytes[i] == 0x1b && (bytes[i + 1] == 0x5c || bytes[i + 1] == 0x5d) {
+                        out.push(bytes[i]);
+                        out.push(bytes[i + 1]);
+                        i += 2;
+                        break;
+                    }
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+                continue;
+            } else if strip_kitty && (is_7bit_g || is_8bit_g) {
+                tracing::trace!(i, "stripping Kitty graphics data");
+                let skip = if is_7bit_g { 3 } else { 2 };
+                i += skip;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == 0x1b && (bytes[i + 1] == 0x5c || bytes[i + 1] == 0x5d) {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // OSC 1337 (iTerm2 inline images): ESC ] 1337 ; ... ESC \ or BEL
+        // OSC 1337 (iTerm2 inline images): ESC ] 1337 ; ... ESC \ or BEL
+        // VT core doesn't parse this, always strip when host_graphics == Sixel
+        if i + 6 < bytes.len() && bytes[i] == 0x1b && bytes[i + 1] == 0x5d {
+            let mut j = i + 2;
+            let mut is_1337 = true;
+            for &b in b"1337" {
+                if j >= bytes.len() || bytes[j] != b {
+                    is_1337 = false;
+                    break;
+                }
+                j += 1;
+            }
+            if is_1337 && j < bytes.len() && bytes[j] == 0x3b {
+                i = j + 1;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == 0x1b && bytes[i + 1] == 0x5c {
+                        i += 2;
+                        break;
+                    }
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 impl PaneTerminal {
     pub(crate) fn new(ghostty: GhosttyPaneTerminal) -> Self {
         Self { ghostty }
@@ -1582,8 +1719,7 @@ impl GhosttyPaneTerminal {
         // ED, so they would otherwise linger on screen). Checked at batch
         // level too so batches without frames (a bare `ESC [ 2 J`) still
         // clear; the segment-level check below handles clears after frames.
-        if crate::sixel::extractor::scan_clear(bytes).is_some()
-            && !core.sixel_image_ids.is_empty()
+        if crate::sixel::extractor::scan_clear(bytes).is_some() && !core.sixel_image_ids.is_empty()
         {
             let ids = core.sixel_image_ids.drain(..).collect::<Vec<_>>();
             let mut delete = Vec::new();
@@ -1593,9 +1729,12 @@ impl GhosttyPaneTerminal {
             core.terminal.write(&delete);
         }
         if segments.is_empty() {
+            // No Sixel frames in this batch; filter graphics control sequences
+            // if host_graphics is Sixel.
+            let filtered = strip_graphics_control_sequences(bytes);
             self.write_pty_bytes_segment(
                 core,
-                bytes,
+                filtered.as_ref(),
                 events,
                 in_progress_default_color_event,
                 terminal_responses,
@@ -1649,9 +1788,18 @@ impl GhosttyPaneTerminal {
             } else {
                 None
             };
+            let segment_bytes = &bytes[seg_start..seg_end];
+            // When host_graphics is Sixel, strip Kitty/OSC1337 graphics control
+            // sequences from non-Sixel segments so they don't leak to the outer
+            // terminal as garbage text.
+            let filtered_bytes = if segment.inject.is_none() {
+                std::borrow::Cow::Owned(segment_bytes.to_vec())
+            } else {
+                strip_graphics_control_sequences(segment_bytes)
+            };
             self.write_pty_bytes_segment(
                 core,
-                &bytes[seg_start..seg_end],
+                filtered_bytes.as_ref(),
                 segment_events,
                 segment_in_progress,
                 terminal_responses,
@@ -4423,13 +4571,9 @@ mod tests {
         assert_eq!(pane.cursor_state().map(|c| (c.x, c.y)), Some((1, 0)));
 
         // Four bands => 24px; default 16px cells => two rows of advance.
-        let result = pane.process_pty_bytes(
-            pane_id,
-            0,
-            b"\x1bPq#1;2;100;100~~~---~\x1b\\tail",
-            &tx,
-        );
-        assert_eq!(result.request_render, true);
+        let result =
+            pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;2;100;100~~~---~\x1b\\tail", &tx);
+        assert!(result.request_render);
         let (x, y) = pane
             .cursor_state()
             .map(|cursor| (cursor.x, cursor.y))
@@ -4516,19 +4660,12 @@ mod tests {
         pane.resize(24, 80, 10, 16);
 
         // Band 0: 20 red pixels wide; band 1: one pixel at column 0.
-        let result = pane.process_pty_bytes(
-            pane_id,
-            0,
-            b"\x1bPq#1;100;0;0!20~-\x40\x1b\\tail",
-            &tx,
-        );
-        assert_eq!(result.request_render, true);
+        let result =
+            pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~-\x40\x1b\\tail", &tx);
+        assert!(result.request_render);
 
         let core = pane.core.lock().unwrap();
-        let placements = core
-            .terminal
-            .kitty_image_placements()
-            .expect("placements");
+        let placements = core.terminal.kitty_image_placements().expect("placements");
         assert_eq!(placements.len(), 1, "relayed frame lands in the parser");
         let placement = &placements[0];
         assert_eq!(placement.image_width, 20);
@@ -4560,7 +4697,13 @@ mod tests {
 
         pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~\x1b\\", &tx);
         assert_eq!(
-            pane.core.lock().unwrap().terminal.kitty_image_placements().unwrap().len(),
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .len(),
             1,
             "frame relayed before the clear"
         );
@@ -4589,7 +4732,13 @@ mod tests {
         pane.process_pty_bytes(pane_id, 0, b"\x1bPq!20~\x1b\\", &tx);
         pane.process_pty_bytes(pane_id, 0, b"\x1b[?80l", &tx);
         assert!(
-            pane.core.lock().unwrap().terminal.kitty_image_placements().unwrap().is_empty(),
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .is_empty(),
             "DECSDM reset erases Sixel images"
         );
     }
@@ -4624,7 +4773,13 @@ mod tests {
 
         pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~\x1b\\", &tx);
         assert_eq!(
-            pane.core.lock().unwrap().terminal.kitty_image_placements().unwrap().len(),
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .len(),
             1,
             "frame placed before scrolling"
         );
@@ -4633,8 +4788,18 @@ mod tests {
         for _ in 0..5 {
             pane.process_pty_bytes(pane_id, 0, b"\n", &tx);
         }
-        let placements = pane.core.lock().unwrap().terminal.kitty_image_placements().unwrap();
-        assert_eq!(placements.len(), 1, "image follows text within the viewport");
+        let placements = pane
+            .core
+            .lock()
+            .unwrap()
+            .terminal
+            .kitty_image_placements()
+            .unwrap();
+        assert_eq!(
+            placements.len(),
+            1,
+            "image follows text within the viewport"
+        );
     }
 
     #[test]

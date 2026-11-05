@@ -548,6 +548,28 @@ The legacy `experimental.kitty_graphics` setting remains accepted for existing c
 
 Changing this setting requires restarting the affected Herdr server or reattaching the client. In remote sessions, the server's setting controls Kitty graphics parsing, while the local client's setting controls output to the outer terminal.
 
+## Sixel graphics
+
+Sixel is the classic DEC raster format. Applications that emit Sixel directly, such as `chafa --format=sixel` and many viewer CLIs, are supported in two directions.
+
+Pane output is read by default. Herdr recognizes a complete Sixel frame in a pane's byte stream, decodes it, and shows it through the same image pipeline as Kitty graphics, so placement, clipping, popups, and cleanup behave like any other pane image. Text an application prints after an image starts on the next free line. With the default `auto`, Herdr relays Sixel only when the outer terminal reports Sixel support in its device attributes; `on` forces relaying and `off` leaves the bytes untouched.
+
+```toml
+[terminal]
+sixel = "auto"
+```
+
+`host_graphics` is the experimental outer-terminal transport. Herdr paints pane images as Kitty graphics placements by default. Set `sixel` for an outer terminal that renders Sixel but not Kitty placements, such as Foot. Herdr scales each image to the client cell size and paints a Sixel frame at the image's cell position.
+
+```toml
+[terminal]
+host_graphics = "sixel"
+```
+
+Sixel has no image-delete sequence. Herdr paints frames while the outer terminal is in Sixel Display Mode (`ESC [ ? 80 h`, restored on exit), so a frame overwrites the cells it covers instead of scrolling the screen, and it asks the client for a full repaint when a frame disappears, which writes those cells again. Every frame defines its colors with explicit RGB, so the outer terminal's Sixel palette is never assumed. `kitty` remains the default transport and is unchanged.
+
+Both settings need a server restart or a client reattach. In remote sessions the server's `sixel` setting controls pane parsing, while the local client's settings control output to the outer terminal.
+
 ## Agent session restore
 
 Herdr resumes supported Agent conversations after a server restart by default:

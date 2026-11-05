@@ -398,6 +398,7 @@ impl App {
         let prefix_keys = config.prefix_keys();
         crate::kitty_graphics::set_enabled(config.kitty_graphics_enabled());
         crate::sixel::set_mode(config.sixel_mode());
+        crate::kitty_graphics::set_host_graphics(config.host_graphics());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());

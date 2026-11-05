@@ -13,6 +13,7 @@ fn output(format: u32) -> GraphicsOutput {
             },
             GraphicsOperation::Bytes(b"after".to_vec()),
         ],
+        repaint_required: false,
     }
 }
 

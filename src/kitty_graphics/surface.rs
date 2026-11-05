@@ -6,9 +6,11 @@ use super::output::GraphicsOutput;
 
 use ratatui::layout::Rect;
 
+use super::sixel_surface;
 use super::{
-    clipped_placement, collect_visible_placements, encode_graphics_output, HostCellSize,
-    HostGraphicsCache, HostPlacement, HostSourceKey, ImageSignature,
+    clipped_placement, collect_visible_placements, encode_graphics_output, host_graphics,
+    GraphicsOperation, HostCellSize, HostGraphics, HostGraphicsCache, HostPlacement, HostSourceKey,
+    ImageSignature,
 };
 use crate::ghostty::{
     KittyImageDescriptor, KittyImageFormat, KittyImagePlacement, KittyPlacementRenderInfo,
@@ -216,6 +218,10 @@ pub(crate) struct ClientState {
     assets: HashMap<SurfaceGraphicsAssetKey, Arc<[u8]>>,
     host: HostGraphicsCache,
     trusted_direct: HashMap<SurfaceGraphicsAssetKey, u32>,
+    sixel: sixel_surface::ClientSixelState,
+    /// Set when painted Sixel frames were dropped: only a full repaint writes the
+    /// covered cells again and clears them.
+    sixel_repaint_pending: bool,
     reset_pending: bool,
     stale_images: Vec<u32>,
     forced_delete_images: Vec<u32>,
@@ -253,6 +259,8 @@ impl ClientState {
         self.trusted_direct.clear();
         self.stale_images.clear();
         self.forced_delete_images.clear();
+        self.sixel = sixel_surface::ClientSixelState::default();
+        self.sixel_repaint_pending = true;
         self.reset_pending = true;
     }
 
@@ -324,25 +332,52 @@ impl ClientState {
     }
 
     pub(crate) fn take_pending_cleanup(&mut self) -> Vec<u8> {
-        let mut bytes = if self.reset_pending {
+        let mut bytes = Vec::new();
+        if self.reset_pending {
             self.reset_pending = false;
             self.stale_images.clear();
-            self.host.clear_bytes()
-        } else {
-            Vec::new()
-        };
+            self.clear_host_images(&mut bytes);
+        }
         self.forced_delete_images.sort_unstable();
         self.forced_delete_images.dedup();
-        for image_id in self.forced_delete_images.drain(..) {
+        let forced = std::mem::take(&mut self.forced_delete_images);
+        for image_id in forced {
             self.host.images.remove(&image_id);
             self.host.placements.retain(|(id, _), _| *id != image_id);
             self.host.sources.retain(|_, id| *id != image_id);
             self.host
                 .replayed_placements
                 .retain(|(id, _)| *id != image_id);
-            super::encode_delete_image(&mut bytes, image_id);
+            self.delete_host_image(&mut bytes, image_id);
         }
         bytes
+    }
+
+    /// Erases one host image with the active outer-terminal protocol.
+    fn delete_host_image(&mut self, bytes: &mut Vec<u8>, image_id: u32) {
+        if host_graphics() == HostGraphics::Sixel {
+            self.sixel_repaint_pending = true;
+        } else {
+            super::encode_delete_image(bytes, image_id);
+        }
+    }
+
+    /// Erases every painted host image with the active outer-terminal protocol.
+    fn clear_host_images(&mut self, bytes: &mut Vec<u8>) {
+        if host_graphics() == HostGraphics::Sixel {
+            self.sixel = sixel_surface::ClientSixelState::default();
+            self.sixel_repaint_pending = true;
+        } else {
+            bytes.extend(self.host.clear_bytes());
+        }
+    }
+
+    /// Hands a pending Sixel erase request to the client, which repaints every
+    /// cell so the stale frame pixels are written over.
+    fn attach_sixel_repaint(&mut self, output: &mut GraphicsOutput) {
+        if std::mem::take(&mut self.sixel_repaint_pending) {
+            output.require_repaint();
+        }
     }
 
     pub(crate) fn set_scene(&mut self, mut scene: SurfaceGraphicsScene) {
@@ -488,9 +523,10 @@ impl ClientState {
         let mut bytes = self.take_pending_cleanup();
         self.stale_images.sort_unstable();
         self.stale_images.dedup();
-        for image_id in self.stale_images.drain(..) {
+        let stale = std::mem::take(&mut self.stale_images);
+        for image_id in stale {
             if self.host.images.remove(&image_id).is_some() {
-                super::encode_delete_image(&mut bytes, image_id);
+                self.delete_host_image(&mut bytes, image_id);
             }
             self.host.placements.retain(|(id, _), _| *id != image_id);
             self.host.sources.retain(|_, id| *id != image_id);
@@ -499,8 +535,10 @@ impl ClientState {
                 .retain(|(id, _)| *id != image_id);
         }
         if !cell_size.is_known() || self.scope.is_empty() {
-            bytes.extend(self.host.clear_bytes());
-            return GraphicsOutput::from_bytes(bytes);
+            self.clear_host_images(&mut bytes);
+            let mut output = GraphicsOutput::from_bytes(bytes);
+            self.attach_sixel_repaint(&mut output);
+            return output;
         }
 
         let visible = self
@@ -512,6 +550,13 @@ impl ClientState {
                     .map(|origin| (placement, origin))
             })
             .collect::<Vec<_>>();
+        if host_graphics() == HostGraphics::Sixel {
+            let mut output = GraphicsOutput::from_bytes(bytes);
+            let targets = self.sixel_targets(&visible, cell_size);
+            output.extend(self.encode_sixel_frames(targets));
+            self.attach_sixel_repaint(&mut output);
+            return output;
+        }
         let pieces = occlusion.frame_pieces(&visible);
         let this = &*self;
         let placements = visible
@@ -536,7 +581,90 @@ impl ClientState {
         let mut output = GraphicsOutput::from_bytes(bytes);
         self.host.request_placement_replay();
         output.extend(encode_graphics_output(&mut self.host, &placements));
+        self.attach_sixel_repaint(&mut output);
         output
+    }
+
+    /// Maps visible placements to the Sixel frames the outer terminal must paint:
+    /// the asset key, the frame geometry in cells, and the outer cell size in
+    /// pixels used for scaling.
+    fn sixel_targets(
+        &self,
+        visible: &[(&SurfaceGraphicsPlacement, (u16, u16))],
+        cell_size: HostCellSize,
+    ) -> Vec<(
+        SurfaceGraphicsAssetKey,
+        sixel_surface::PaintedFrame,
+        (u32, u32),
+    )> {
+        visible
+            .iter()
+            .map(|(placement, origin)| {
+                (
+                    placement.asset.clone(),
+                    sixel_surface::PaintedFrame {
+                        row: origin.1,
+                        col: origin.0,
+                        cols: placement.cols,
+                        rows: placement.rows,
+                    },
+                    (cell_size.width_px.max(1), cell_size.height_px.max(1)),
+                )
+            })
+            .collect()
+    }
+
+    /// Paints the current scene as Sixel frames on the outer terminal.
+    ///
+    /// A frame is repainted when its geometry changed, which overwrites the
+    /// previous frame at the same cells. A frame that left the scene, moved, or
+    /// could not be painted leaves pixels the terminal cannot erase, so the client
+    /// is asked for a full repaint.
+    fn encode_sixel_frames(
+        &mut self,
+        targets: Vec<(
+            SurfaceGraphicsAssetKey,
+            sixel_surface::PaintedFrame,
+            (u32, u32),
+        )>,
+    ) -> GraphicsOutput {
+        let desired_map: HashMap<_, _> = targets
+            .iter()
+            .map(|(key, frame, _)| (key.clone(), *frame))
+            .collect();
+        let mut ops = Vec::new();
+        for (key, painted) in &self.sixel.painted {
+            if desired_map.get(key) != Some(painted) {
+                self.sixel_repaint_pending = true;
+            }
+        }
+        for (key, frame, cell) in &targets {
+            if self.sixel.painted.get(key).copied() == Some(*frame) {
+                continue;
+            }
+            let Some(rgba) = self.assets.get(key) else {
+                self.sixel_repaint_pending |= self.sixel.painted.contains_key(key);
+                continue;
+            };
+            let bytes = sixel_surface::encode_frame(
+                rgba,
+                key.image_width,
+                key.image_height,
+                cell.0,
+                cell.1,
+                frame.cols,
+                frame.rows,
+                frame.row,
+                frame.col,
+            );
+            if bytes.is_empty() {
+                self.sixel_repaint_pending |= self.sixel.painted.contains_key(key);
+                continue;
+            }
+            ops.push(GraphicsOperation::Bytes(bytes));
+        }
+        self.sixel.painted = desired_map;
+        GraphicsOutput::from_ops(ops)
     }
 }
 
@@ -1111,6 +1239,52 @@ fn format_code(format: SurfaceGraphicsFormat) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_painted_sixel_frame_requests_a_full_repaint() {
+        use super::sixel_surface::PaintedFrame;
+        use crate::kitty_graphics::GraphicsOperation;
+        let mut state = ClientState::default();
+        state.set_scope("sixel-repaint");
+        let target = SurfaceGraphicsTarget::Pane {
+            pane_id: "pane".into(),
+        };
+        let image = asset(target.clone(), 1, vec![255, 0, 0, 255]);
+        let key = image.key.clone();
+        state.assets.insert(key.clone(), Arc::from(image.data));
+        let frame = PaintedFrame {
+            row: 1,
+            col: 2,
+            cols: 2,
+            rows: 2,
+        };
+
+        let output = state.encode_sixel_frames(vec![(key.clone(), frame, (8, 16))]);
+        assert!(
+            matches!(output.operations.as_slice(), [GraphicsOperation::Bytes(bytes)] if !bytes.is_empty()),
+            "the frame is painted once"
+        );
+        assert!(!output.repaint_required, "painting needs no repaint");
+        assert_eq!(state.sixel.painted.get(&key), Some(&frame));
+
+        let output = state.encode_sixel_frames(vec![(key.clone(), frame, (8, 16))]);
+        assert!(
+            output.operations.is_empty(),
+            "an unchanged frame is not repainted"
+        );
+
+        let mut output = state.encode_sixel_frames(Vec::new());
+        assert!(
+            output.operations.is_empty(),
+            "Sixel has no erase bytes to emit"
+        );
+        state.attach_sixel_repaint(&mut output);
+        assert!(
+            output.repaint_required,
+            "the dropped frame needs its cells written again"
+        );
+        assert!(!state.sixel_repaint_pending, "the request is consumed once");
+    }
 
     fn asset(
         target: SurfaceGraphicsTarget,

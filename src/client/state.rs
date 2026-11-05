@@ -581,13 +581,16 @@ impl ClientState {
         } else {
             self.blit_encoder.encode(&frame_data, self.repaint_pending)
         };
+        // Sixel frames cannot be erased by the terminal, so dropping one asks the
+        // next frame to repaint every cell over the stale pixels.
+        let repaint_after_graphics = graphics.repaint_required;
         if let Err(error) = self.write_composed_output(writer, &encoded.bytes, graphics) {
             tracing::warn!(%error, "failed to present client frame");
             self.repaint_pending = true;
             return false;
         }
         self.blit_encoder.commit(frame_data, encoded);
-        self.repaint_pending = false;
+        self.repaint_pending = repaint_after_graphics;
         true
     }
 }
@@ -595,6 +598,38 @@ impl ClientState {
 #[cfg(all(test, unix))]
 mod native_cleanup_tests {
     use super::*;
+
+    #[test]
+    fn a_sixel_erase_request_marks_the_next_frame_for_a_full_repaint() {
+        let mut state = ClientState::test_new();
+        state.kitty_graphics_enabled = true;
+        let frame = crate::protocol::FrameData {
+            cells: Vec::new(),
+            width: 0,
+            height: 0,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        state.kitty_graphics_enabled = false;
+        assert!(state.try_present_frame_to(&mut output, frame.clone()));
+        assert!(
+            !state.repaint_pending,
+            "an ordinary frame stays on the retained patch path"
+        );
+
+        let mut graphics = crate::kitty_graphics::GraphicsOutput::from_bytes(Vec::new());
+        graphics.require_repaint();
+        state.kitty_graphics_enabled = true;
+        assert!(state
+            .try_present_frame_to(&mut output, frame_output::ComposedFrame { frame, graphics }));
+        assert!(
+            state.repaint_pending,
+            "a dropped sixel frame must be written over by the next frame"
+        );
+    }
 
     #[test]
     fn retired_graphics_tombstones_survive_handoff_and_only_exact_files_consume_them() {
