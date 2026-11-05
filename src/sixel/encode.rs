@@ -6,7 +6,7 @@
 //! * the P1 header uses the 12-parameter DEC layout terminals parse, with the
 //!   grid, the aspect ratio overrides and the graphic rectangle left neutral,
 //!   and a transparent background,
-//! * the raster attributes declare the frame size with DECGRA (`"1;1;W;H`),
+//! * the raster attributes declare the frame size with DECGRA (`"1;1;H;W`),
 //! * every colour the frame paints is defined with explicit percent RGB
 //!   (`#Pc;2;R;G;B`) before it is selected, because a terminal's Sixel palette
 //!   is not guaranteed to contain the DEC 6x6x6 cube: Foot preloads only the
@@ -250,12 +250,13 @@ fn frame_header() -> Vec<u8> {
     b"\x1bP0;1;0;0;1;1;0;0;0;0;0;0q".to_vec()
 }
 
-/// DECGRA raster attributes: `PAN;PAD;W;H` with square pixels and the declared
-/// width before the declared height. Foot, xterm and libsixel all read the
-/// extent that way; declaring them the other way round stretches the image into
-/// a transposed rectangle. `PAD == 1` keeps foot on its 1:1 put handler.
+/// DECGRA raster attributes: `PAN;PAD;V;H` with square pixels and the vertical
+/// extent before the horizontal extent, which is the order foot and xterm parse
+/// (`pan;pad;pixel vertical extent;pixel horizontal extent`). Declaring them the
+/// other way round makes the terminal preallocate a transposed raster buffer.
+/// `PAD == 1` keeps foot on its 1:1 put handler.
 fn raster_attributes(width: usize, height: usize) -> Vec<u8> {
-    format!("\"1;1;{width};{height}").into_bytes()
+    format!("\"1;1;{height};{width}").into_bytes()
 }
 
 /// Encodes `src` scaled to `dst_width` by `dst_height` as one self-contained
@@ -291,6 +292,14 @@ mod tests {
     use super::*;
     use crate::sixel::decode::decode_sixel;
 
+    fn solid_rgba(w: usize, h: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity(w * h * 4);
+        for _ in 0..(w * h) {
+            v.extend([r, g, b, 255]);
+        }
+        v
+    }
+
     fn rgba_pattern(w: usize, h: usize) -> Vec<u8> {
         let mut v = Vec::new();
         for y in 0..h {
@@ -305,20 +314,28 @@ mod tests {
     }
 
     /// Prints the encoded frame for manual inspection on a real terminal.
-    /// Quiet by default; run with `HERDR_SIXEL_DUMP=1` for the 24x12 frame, or
-    /// `HERDR_SIXEL_DUMP=WIDTHxHEIGHT` for a frame of that pixel size.
+    /// Quiet by default; run with `HERDR_SIXEL_DUMP=1` for the 24x12 frame,
+    /// `HERDR_SIXEL_DUMP=WIDTHxHEIGHT` for a gradient frame of that pixel size,
+    /// or `HERDR_SIXEL_DUMP=solid:WIDTHxHEIGHT` for a single-colour frame, which
+    /// is the only shape a screenshot measurement can locate unambiguously.
     #[test]
     fn debug_dump() {
-        let Some(spec) = std::env::var_os("HERDR_SIXEL_DUMP") else {
+        let Some(env) = std::env::var_os("HERDR_SIXEL_DUMP") else {
             return;
         };
-        let spec = spec.to_string_lossy().to_string();
+        let spec = env.to_string_lossy().to_string();
+        let solid = spec.strip_prefix("solid:");
+        let spec = solid.unwrap_or(&spec);
         let (width, height): (usize, u32) = match spec.split_once('x') {
             Some((w, h)) => (w.parse().unwrap_or(24), h.parse().unwrap_or(12)),
             None => (24, 12),
         };
         let height = height as usize;
-        let rgba = rgba_pattern(width, height);
+        let rgba = if solid.is_some() {
+            solid_rgba(width, height, 255, 0, 255)
+        } else {
+            rgba_pattern(width, height)
+        };
         let payload = encode_frame(&rgba, width, height, width, height);
         println!("payload: {}", String::from_utf8_lossy(&payload));
 
@@ -622,17 +639,17 @@ mod tests {
     }
 
     #[test]
-    fn decgra_declares_the_width_before_the_height() {
+    fn decgra_declares_the_vertical_extent_before_the_horizontal_extent() {
         let rgba = rgba_pattern(20, 6);
         let payload = encode_frame(&rgba, 20, 6, 20, 6);
         let body = String::from_utf8_lossy(&payload);
         assert!(
-            body.contains("\"1;1;20;6"),
-            "a non-square frame declares width then height, the order Foot, xterm and libsixel read: {body}"
+            body.contains("\"1;1;6;20"),
+            "a 20x6 frame declares the 6px vertical extent then the 20px horizontal extent, the order foot and xterm parse: {body}"
         );
         assert!(
-            !body.contains("\"1;1;6;20"),
-            "the extent is never declared height first, which stretches the image into a transposed rectangle: {body}"
+            !body.contains("\"1;1;20;6"),
+            "the extent is never declared width first, which makes the terminal preallocate a transposed raster: {body}"
         );
     }
 
