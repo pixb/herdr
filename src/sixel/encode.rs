@@ -13,6 +13,10 @@
 //!   16 theme colours, and xterm wraps register numbers by its register count,
 //! * Raster Graphics uses ASCII band characters `? ! " # $ % &`, and RLE encodes
 //!   runs as `char` for runs of 1-3 and `!` `run` `char` for runs of 4+,
+//! * a band line never contains a space: foot and xterm ignore one without
+//!   moving the graphics pen, which folds the columns after a gap onto the
+//!   columns before it, so gaps are painted with the background register the
+//!   P1 header declares transparent,
 //! * the frame closes with the DCS string terminator. Sixel has no image-delete
 //!   sequence, so no erasure is emitted; the caller repaints the covered cells.
 //!
@@ -129,36 +133,49 @@ pub fn encode_band(
     }
 }
 
-/// Encodes one colour's band line in canonical RLE: each column's mask byte (bit
-/// `y` = row `band * 6 + y`) maps to the band character `mask + 0x3f`, unpainted
-/// runs are spaces that advance the pen, and runs of 4+ identical masks collapse
-/// to `!` `count` `char`. Trailing empty columns are dropped, keeping the frame
-/// compact.
-pub fn rle_band_line(mask: &[u8], width: usize) -> Vec<u8> {
+fn push_rle(out: &mut Vec<u8>, run: usize, ch: u8) {
+    if run >= 4 {
+        out.push(b'!');
+        out.extend(run.to_string().into_bytes());
+        out.push(ch);
+    } else {
+        for _ in 0..run {
+            out.push(ch);
+        }
+    }
+}
+
+/// Encodes one colour's band line: each column's mask byte (bit `y` = row
+/// `band * 6 + y`) maps to the band character `mask + 0x3f`, runs of 4+
+/// identical masks collapse to `!` `count` `char`, and the line selects the
+/// registers it paints.
+///
+/// Columns the colour does not paint are filled with the background register,
+/// which the frame declares transparent in the P1 header. They are never left
+/// as spaces: foot's and xterm's decoders ignore a space without moving the
+/// graphics pen, so a space gap folds the columns after it back onto the
+/// columns before it. Trailing gaps are dropped, keeping the frame compact.
+pub fn color_band_line(register: usize, mask: &[u8], width: usize) -> Vec<u8> {
+    let Some(last) = mask[..width].iter().rposition(|m| *m != 0) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
+    let mut selected: Option<usize> = None;
     let mut i = 0;
-    while i < width {
+    while i <= last {
         let mask_byte = mask[i];
         let mut run = 1;
-        while i + run < width && mask[i + run] == mask_byte {
+        while i + run <= last && mask[i + run] == mask_byte {
             run += 1;
         }
-        if mask_byte == 0 {
-            out.extend(std::iter::repeat_n(b' ', run));
-        } else if run >= 4 {
-            out.push(b'!');
-            out.extend(run.to_string().into_bytes());
-            out.push(mask_byte + 0x3f);
-        } else {
-            for _ in 0..run {
-                out.push(mask_byte + 0x3f);
-            }
+        let target = if mask_byte == 0 { 0 } else { register };
+        if selected != Some(target) {
+            out.push(b'#');
+            out.extend(target.to_string().into_bytes());
+            selected = Some(target);
         }
+        push_rle(&mut out, run, mask_byte + 0x3f);
         i += run;
-    }
-    let last = out.iter().rposition(|b| *b != b' ');
-    if let Some(last) = last {
-        out.truncate(last + 1);
     }
     out
 }
@@ -202,13 +219,11 @@ fn encode_body(indexed: &[usize], width: usize, height: usize) -> Vec<u8> {
         let mut lines = Vec::new();
         encode_band(indexed, width, height, band, &mut lines);
         for (idx, mask) in lines {
-            let line = rle_band_line(&mask, width);
+            let line = color_band_line(idx, &mask, width);
             if line.is_empty() {
                 continue;
             }
             painted = true;
-            body.push(b'#');
-            body.extend(idx.to_string().into_bytes());
             body.extend(line);
             body.push(b'$');
         }
@@ -406,15 +421,16 @@ mod tests {
                 g as usize * 100 / 255,
                 b as usize * 100 / 255
             );
-            assert!(
-                body.contains(&definition),
-                "register {register} is defined with explicit RGB: {body}"
+            assert_eq!(
+                body.matches(&definition).count(),
+                1,
+                "register {register} is defined with explicit RGB exactly once: {body}"
             );
         }
-        assert_eq!(
-            body.matches('#').count(),
-            registers.len() + body.matches('$').count(),
-            "every register is defined once, and every painted line selects one and ends with `$`"
+        let selects = body.bytes().filter(|b| *b == b'#').count() - registers.len();
+        assert!(
+            selects >= body.matches('$').count(),
+            "every painted line selects the register it paints: {body}"
         );
     }
 
@@ -425,8 +441,8 @@ mod tests {
         encode_band(&indexed, 10, 6, 0, &mut lines);
         assert_eq!(lines.len(), 1, "one colour covers the band");
         assert_eq!(
-            String::from_utf8(rle_band_line(&lines[0].1, 10)).unwrap(),
-            "!10~",
+            String::from_utf8(color_band_line(17, &lines[0].1, 10)).unwrap(),
+            "#17!10~",
             "the six-row band character is 0x7e and runs above 3 collapse"
         );
         let mut mask = vec![0u8; 10];
@@ -434,9 +450,128 @@ mod tests {
         mask[1] = 1;
         mask[2] = 0;
         assert_eq!(
-            String::from_utf8(rle_band_line(&mask, 10)).unwrap(),
-            "@@",
-            "runs below four repeat the band character, empty columns advance the pen"
+            String::from_utf8(color_band_line(9, &mask, 10)).unwrap(),
+            "#9@@",
+            "runs below four repeat the band character and trailing gaps are dropped"
+        );
+    }
+
+    #[test]
+    fn an_interior_gap_advances_the_pen_with_the_background_register() {
+        let mut mask = vec![0u8; 10];
+        mask[0] = 1;
+        mask[1] = 1;
+        mask[8] = 1;
+        mask[9] = 1;
+        let line = String::from_utf8(color_band_line(5, &mask, 10)).unwrap();
+        assert_eq!(line, "#5@@#0!6?#5@@");
+        assert!(
+            !line.contains(' '),
+            "a decoder that ignores spaces must still advance the pen"
+        );
+        assert_eq!(
+            band_line_columns(&line),
+            10,
+            "the painted columns land where the raster has them: {line}"
+        );
+    }
+
+    /// Counts the columns a band line moves the graphics pen across, the way a
+    /// decoder that ignores everything but band characters sees them.
+    fn band_line_columns(line: &str) -> usize {
+        let bytes = line.as_bytes();
+        let mut columns = 0usize;
+        let mut i = 0usize;
+        let mut first_column = None;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'#' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                b'!' => {
+                    i += 1;
+                    let mut run = 0usize;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        run = run * 10 + usize::from(bytes[i] - b'0');
+                        i += 1;
+                    }
+                    let painted = bytes.get(i).copied().unwrap_or(b'?') != b'?';
+                    if painted {
+                        first_column.get_or_insert(columns);
+                    }
+                    columns += run;
+                    i += 1;
+                }
+                b'?'..=b'~' => {
+                    if bytes[i] != b'?' {
+                        first_column.get_or_insert(columns);
+                    }
+                    columns += 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        first_column.map_or(0, |first| columns - first)
+    }
+
+    #[test]
+    fn every_band_line_covers_its_painted_width() {
+        let rgba = rgba_pattern(37, 18);
+        let payload = encode_frame(&rgba, 37, 18, 37, 18);
+        let text = String::from_utf8_lossy(&payload);
+        let body = &text[text.rfind('"').expect("decstra") + 1..];
+        let mut checked = 0usize;
+        for line in body.split(['-', '$']) {
+            let line = line.trim_start_matches('\'');
+            if line.is_empty() {
+                continue;
+            }
+            let columns = band_line_columns(line);
+            assert!(
+                columns > 0 && columns <= 37,
+                "a band line stays inside the declared raster: {line}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "the frame has band lines: {text}");
+    }
+
+    #[test]
+    fn encoded_frames_contain_no_space_gaps() {
+        let rgba = rgba_pattern(30, 12);
+        let payload = encode_frame(&rgba, 30, 12, 20, 10);
+        assert!(payload.windows(2).any(|w| w == b"\x1bP"));
+        assert!(
+            !payload.contains(&b' '),
+            "{}",
+            String::from_utf8_lossy(&payload)
+        );
+    }
+
+    /// Drops every space from a frame, the way foot and xterm read them: their
+    /// Sixel handlers ignore a space without moving the graphics pen, so a
+    /// decoder fed this stream is stricter than one that honours the skip.
+    fn without_spaces(payload: &[u8]) -> Vec<u8> {
+        payload.iter().copied().filter(|b| *b != b' ').collect()
+    }
+
+    #[test]
+    fn frames_survive_a_decoder_that_ignores_spaces() {
+        let rgba = rgba_pattern(24, 12);
+        let payload = encode_frame(&rgba, 24, 12, 24, 12);
+        let strict = decode_sixel(&without_spaces(&payload), 12, None).expect("decode frame");
+        let lenient = decode_sixel(&payload, 12, None).expect("decode frame");
+        assert_eq!(
+            strict.width, lenient.width,
+            "ignoring the space gaps must not fold the image narrower"
+        );
+        assert_eq!(
+            strict.rgba, lenient.rgba,
+            "the pen lands on the same columns with or without the gaps"
         );
     }
 
