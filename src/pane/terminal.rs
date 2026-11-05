@@ -284,98 +284,40 @@ fn collect_sixel_segments(core: &mut GhosttyPaneCore, bytes: &[u8]) -> Vec<Sixel
     segments
 }
 
-/// Strip graphics control sequences that the outer terminal shouldn't see
-/// when `host_graphics == Sixel`. Removes:
-/// - Kitty DCS: `ESC P ... ESC \` (or 7-bit `ESC _ ... ESC \`)
-/// - Kitty ESC G: `ESC G ...`
+/// Strip graphics control sequences the outer terminal should not see when
+/// `host_graphics == Sixel`. Removes:
+/// - Kitty graphics: `ESC _ G ... ESC \` and `ESC P G ... ESC \`
 /// - OSC 1337 (iTerm2 inline images): `ESC ] 1337 ; ... ESC \` / `BEL`
+///
+/// Kitty introducers are passed through untouched while ingestion is enabled. The
+/// shared VT core recognizes both forms itself: `apc.zig` switches to the Kitty
+/// graphics parser on `ESC _` followed by `G`. Rewriting `ESC _` into `ESC P`, or
+/// dropping the `_` from `ESC _ G`, takes the sequence away from that parser, the
+/// introducer is swallowed as an unrecognized escape, and the base64 payload lands
+/// in the grid as visible text.
 fn strip_graphics_control_sequences(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let hg = crate::kitty_graphics::host_graphics();
-    let kitty_enabled = crate::kitty_graphics::is_enabled();
     if hg != crate::kitty_graphics::HostGraphics::Sixel {
         // The default transport forwards the batch untouched: no copy on the hot path.
         return std::borrow::Cow::Borrowed(bytes);
     }
-    // When host_graphics == Sixel:
-    // - If kitty_graphics is enabled, VT core parses Kitty graphics (ESC P/ESC G) into placements.
-    //   Convert 7-bit DCS (ESC _) to 8-bit (ESC P) so VT core recognizes them.
-    // - If kitty_graphics is disabled, strip all Kitty graphics sequences (VT core won't parse).
-    // - Always strip OSC 1337 (iTerm2) which VT core doesn't parse.
-    let strip_kitty = !kitty_enabled;
+    // When host_graphics == Sixel the VT core owns the graphics protocols: it
+    // parses Sixel DCS and both Kitty introducer forms into placements, and the
+    // surface layer repaints them in the one encoding the host understands. Only
+    // sequences the VT core cannot parse need removal here.
+    let strip_kitty = !crate::kitty_graphics::is_enabled();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        // ESC P (DCS) or ESC _ (7-bit DCS)
-        if i + 1 < bytes.len() && bytes[i] == 0x1b && (bytes[i + 1] == 0x50 || bytes[i + 1] == 0x5f)
-        {
-            let is_7bit = bytes[i + 1] == 0x5f;
-            // Convert 7-bit DCS to 8-bit for VT core compatibility
-            if is_7bit && kitty_enabled && !strip_kitty {
-                tracing::trace!(i, "converting 7-bit DCS ESC _ to ESC P");
-                out.push(0x1b);
-                out.push(0x50); // ESC P
-                i += 2;
-            } else if strip_kitty {
-                tracing::trace!(i, "stripping DCS sequence");
-                i += 2;
-                while i + 1 < bytes.len() {
-                    if bytes[i] == 0x1b && (bytes[i + 1] == 0x5c || bytes[i + 1] == 0x5d) {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            } else {
-                // Pass through 8-bit DCS as-is
-                out.push(bytes[i]);
-                out.push(bytes[i + 1]);
-                i += 2;
-            }
-            // Copy DCS payload until terminator
-            while i + 1 < bytes.len() {
-                if bytes[i] == 0x1b && (bytes[i + 1] == 0x5c || bytes[i + 1] == 0x5d) {
-                    out.push(bytes[i]);
-                    out.push(bytes[i + 1]);
-                    i += 2;
-                    break;
-                }
-                out.push(bytes[i]);
-                i += 1;
-            }
-            continue;
-        }
-        // ESC G (Kitty graphics data) or ESC _ G (7-bit)
-        if i + 1 < bytes.len() && bytes[i] == 0x1b {
-            let is_7bit_g = bytes[i + 1] == 0x5f && i + 2 < bytes.len() && bytes[i + 2] == 0x47;
-            let is_8bit_g = bytes[i + 1] == 0x47;
-            if (is_7bit_g || is_8bit_g) && kitty_enabled && !strip_kitty {
-                if is_7bit_g {
-                    tracing::trace!(i, "converting 7-bit ESC _ G to ESC G");
-                    out.push(0x1b);
-                    out.push(0x47); // ESC G
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    out.push(bytes[i + 1]);
-                    i += 2;
-                }
-                // Copy payload until terminator
-                while i + 1 < bytes.len() {
-                    if bytes[i] == 0x1b && (bytes[i + 1] == 0x5c || bytes[i + 1] == 0x5d) {
-                        out.push(bytes[i]);
-                        out.push(bytes[i + 1]);
-                        i += 2;
-                        break;
-                    }
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-                continue;
-            } else if strip_kitty && (is_7bit_g || is_8bit_g) {
-                tracing::trace!(i, "stripping Kitty graphics data");
-                let skip = if is_7bit_g { 3 } else { 2 };
-                i += skip;
+        if strip_kitty && i + 1 < bytes.len() && bytes[i] == 0x1b {
+            let introducer = match bytes[i + 1] {
+                // `ESC P G` is the 8-bit DCS form, `ESC _ G` the 7-bit APC form.
+                0x50 | 0x5f => i + 2 < bytes.len() && bytes[i + 2] == 0x47,
+                0x47 => true,
+                _ => false,
+            };
+            if introducer {
+                i += if bytes[i + 1] == 0x47 { 2 } else { 3 };
                 while i + 1 < bytes.len() {
                     if bytes[i] == 0x1b && (bytes[i + 1] == 0x5c || bytes[i + 1] == 0x5d) {
                         i += 2;
@@ -386,7 +328,6 @@ fn strip_graphics_control_sequences(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> 
                 continue;
             }
         }
-        // OSC 1337 (iTerm2 inline images): ESC ] 1337 ; ... ESC \ or BEL
         // OSC 1337 (iTerm2 inline images): ESC ] 1337 ; ... ESC \ or BEL
         // VT core doesn't parse this, always strip when host_graphics == Sixel
         if i + 6 < bytes.len() && bytes[i] == 0x1b && bytes[i + 1] == 0x5d {
@@ -4076,6 +4017,41 @@ mod tests {
     fn palette_overrides_are_none_without_an_osc4_write() {
         let default = [rgb(1, 2, 3); 256];
         assert!(PaletteOverrides::new(&default, &default).is_none());
+    }
+
+    #[test]
+    fn sixel_transport_leaves_the_kitty_introducer_for_the_vt_core() {
+        let frame = b"\x1b_Ga=T,f=32,s=6,v=6,c=2,r=1,q=2;aGVsbA==\x1b\\done";
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::kitty_graphics::set_enabled(true);
+        assert_eq!(
+            strip_graphics_control_sequences(frame).as_ref(),
+            &frame[..],
+            "the VT core parses ESC _ G itself, so the introducer must survive intact"
+        );
+
+        crate::kitty_graphics::set_enabled(false);
+        assert_eq!(
+            strip_graphics_control_sequences(frame).as_ref(),
+            &b"done"[..],
+            "without ingestion the whole transmission is removed"
+        );
+
+        crate::kitty_graphics::set_enabled(true);
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+
+    #[test]
+    fn sixel_transport_strips_the_iterm2_inline_image_osc() {
+        let input = b"\x1b]1337;File=size=6;inline=1:aGVsbA==\x1b\\ok";
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::kitty_graphics::set_enabled(true);
+        assert_eq!(
+            strip_graphics_control_sequences(input).as_ref(),
+            &b"ok"[..],
+            "the VT core has no OSC 1337 parser, so it must not reach the grid"
+        );
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
     }
 
     #[test]
