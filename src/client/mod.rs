@@ -163,6 +163,20 @@ use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
 
 /// The decoder for whichever optional surface encodings this connection negotiated.
+/// Graphics protocols that address the host terminal in pixels, not cells.
+///
+/// The Kitty protocol needs the cell pixel size for placements, and Sixel needs it
+/// for the frame extent: a Sixel frame is measured in the host terminal's pixels.
+/// Without the geometry, Herdr assumes a cell size and every painted image lands at
+/// the wrong scale.
+fn needs_host_pixel_geometry(kitty_graphics_enabled: bool) -> bool {
+    kitty_graphics_enabled
+        || matches!(
+            crate::kitty_graphics::host_graphics(),
+            crate::kitty_graphics::HostGraphics::Sixel
+        )
+}
+
 fn negotiated_surface_decoder(
     negotiation: &endpoint::EndpointNegotiation,
 ) -> Option<protocol::surface_reuse::Decoder> {
@@ -209,7 +223,12 @@ fn run_client_with_mode(
     crate::kitty_graphics::set_host_graphics(loaded_config.config.host_graphics());
     let kitty_graphics_enabled =
         loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
-    let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();
+    // Sixel has no placement: a frame is sized in the host terminal's own pixels,
+    // so painting pane images as Sixel needs the pixel geometry just like the
+    // Kitty protocol does. Without it the cell size falls back to an assumed
+    // default and every frame is painted at the wrong scale.
+    let needs_host_pixel_geometry = needs_host_pixel_geometry(kitty_graphics_enabled);
+    let pixel_geometry_enabled = needs_host_pixel_geometry || attach_escape.is_some();
     let endpoint_keybindings = shell_config
         .as_ref()
         .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
@@ -258,7 +277,7 @@ fn run_client_with_mode(
 
     // Get one coherent geometry snapshot before raw mode changes the terminal.
     let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
-        initial_terminal_geometry(pixel_geometry_enabled, kitty_graphics_enabled)?;
+        initial_terminal_geometry(pixel_geometry_enabled, needs_host_pixel_geometry)?;
 
     let direct_attach = attach_escape.is_some();
     let mut terminal_guard = if direct_attach {
@@ -549,7 +568,7 @@ async fn run_client_loop(
     // Terminals behind ConPTY report no pixel size through the ioctl, so ask the
     // host terminal directly instead of falling back to an assumed cell size.
     let will_query_host_cell_size = state.attach_escape.is_none()
-        && host_cell_size_query_required(state.kitty_graphics_enabled);
+        && host_cell_size_query_required(needs_host_pixel_geometry(state.kitty_graphics_enabled));
     let stdin_quit = should_quit.clone();
     let stdin_mouse_capture_active = host_mouse_capture_active.clone();
     let stdin_sgr_pixels_active = host_sgr_pixels_active.clone();

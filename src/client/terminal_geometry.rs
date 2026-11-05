@@ -244,8 +244,8 @@ pub(super) fn should_query_host_cell_size() -> bool {
     !cfg!(windows)
 }
 
-pub(super) fn host_cell_size_query_required(kitty_graphics_enabled: bool) -> bool {
-    kitty_graphics_enabled && should_query_host_cell_size() && ioctl_terminal_geometry().is_none()
+pub(super) fn host_cell_size_query_required(needs_pixel_geometry: bool) -> bool {
+    needs_pixel_geometry && should_query_host_cell_size() && ioctl_terminal_geometry().is_none()
 }
 
 pub(super) fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {
