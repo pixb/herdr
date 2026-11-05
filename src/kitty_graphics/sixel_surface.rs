@@ -97,7 +97,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with(
-                "\x1b[4;6H\x1bP0;1;0;1;1;16;32;0;16;32;0;0;0;0;1;1q\"1;1;32;16#181;2;100;0;0",
+                "\x1b[4;6H\x1bP0;1;0;0;1;1;0;0;0;0;0;0q\"1;1;16;32#181;2;100;0;0",
             ),
             "the frame places row 4 col 6, declares a 16x32 target, and defines its red register: {text}"
         );
