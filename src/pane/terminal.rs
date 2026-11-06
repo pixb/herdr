@@ -209,6 +209,10 @@ pub(crate) struct GhosttyPaneCore {
     /// Host cell size in pixels; Sixel images map to grid cells through them.
     pub cell_width_px: u32,
     pub cell_height_px: u32,
+    /// Tail of a Kitty introducer that a PTY batch boundary cut in half. A
+    /// text-caching previewer already corrupts the introducer's ESC byte, and the
+    /// repair needs the whole pattern, so the fragment is joined to the next batch.
+    pub introducer_repair: IntroducerRepairState,
     /// Synthetic image IDs relayed for this pane; deleted when the child
     /// clears the screen or toggles DECSDM (the VT core keeps Kitty
     /// placements on ED).
@@ -284,19 +288,252 @@ fn collect_sixel_segments(core: &mut GhosttyPaneCore, bytes: &[u8]) -> Vec<Sixel
     segments
 }
 
-/// Strip graphics control sequences the outer terminal should not see when
-/// `host_graphics == Sixel`. Removes:
-/// - Kitty graphics: `ESC _ G ... ESC \` and `ESC P G ... ESC \`
-/// - OSC 1337 (iTerm2 inline images): `ESC ] 1337 ; ... ESC \` / `BEL`
-///
-/// Kitty introducers are passed through untouched while ingestion is enabled. The
-/// shared VT core recognizes both forms itself: `apc.zig` switches to the Kitty
-/// graphics parser on `ESC _` followed by `G`. Rewriting `ESC _` into `ESC P`, or
-/// dropping the `_` from `ESC _ G`, takes the sequence away from that parser, the
-/// introducer is swallowed as an unrecognized escape, and the base64 payload lands
-/// in the grid as visible text.
-fn strip_graphics_control_sequences(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+// Graphics control sequences the outer terminal should not see when
+// `host_graphics == Sixel`:
+// - Kitty graphics: `ESC _ G ... ESC \` and `ESC P G ... ESC \`
+// - OSC 1337 (iTerm2 inline images): `ESC ] 1337 ; ... ESC \` / `BEL`
+// Kitty introducers are passed through untouched while ingestion is enabled. The
+// shared VT core recognizes both forms itself: `apc.zig` switches to the Kitty
+// graphics parser on `ESC _` followed by `G`. Rewriting `ESC _` into `ESC P`, or
+// dropping the `_` from `ESC _ G`, takes the sequence away from that parser, the
+// introducer is swallowed as an unrecognized escape, and the base64 payload lands
+// in the grid as visible text.
+
+/// True when a batch starts a Kitty transmission in either introducer form.
+fn has_kitty_introducer(bytes: &[u8]) -> bool {
+    bytes
+        .windows(3)
+        .any(|window| window == b"\x1b_G" || window == b"\x1bPG")
+}
+
+/// Lowercase hex of a short byte slice, for the arrival-shape diagnostic.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+/// First index of `needle` in `haystack`, if present.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Introducer forms a text-caching previewer produces for `ESC _ G`. Its output
+/// passes through a lossy text conversion, so the ESC (and sometimes the `_`)
+/// arrives as U+FFFD. The VT core cannot recognize any of these, so the
+/// transmission's metadata and payload would land in the grid as visible text.
+const BROKEN_KITTY_INTRODUCERS: &[&[u8]] = &[
+    b"\xef\xbf\xbd\xef\xbf\xbd_G",
+    b"\xef\xbf\xbd_G",
+    b"\xef\xbf\xbdG",
+];
+
+/// Kitty transmission metadata keys, used to confirm a repaired introducer really
+/// starts a transmission instead of rewriting arbitrary text.
+const KITTY_METADATA_KEYS: &[&[u8]] = &[
+    b"a=", b"f=", b"s=", b"v=", b"i=", b"p=", b"d=", b"m=", b"c=", b"r=", b"x=", b"y=", b"X=",
+    b"Y=", b"z=", b"o=", b"q=", b"t=", b"n=", b"b=", b"E=", b"T=", b"C=", b"S=", b"A=",
+];
+
+/// The Sixel DCS introducer as a text cache leaves it: U+FFFD `P` params `q`.
+const BROKEN_SIXEL_DCS_PREFIX: &[u8] = b"\xef\xbf\xbdP";
+
+/// Patterns whose prefix a batch boundary can cut, so the fragment is held back.
+const INTRODUCER_FRAGMENTS: &[&[u8]] = &[
+    b"\xef\xbf\xbd\xef\xbf\xbd_G",
+    b"\xef\xbf\xbd_G",
+    b"\xef\xbf\xbdG",
+    b"\xef\xbf\xbdP",
+];
+
+/// Recognize a mangled Sixel DCS introducer: U+FFFD `P`, optional numeric band
+/// parameters, then `q`. The parameter shape is the gate; ordinary text that
+/// happens to contain U+FFFD before a `P` is left alone.
+fn broken_sixel_introducer_len(tail: &[u8]) -> Option<usize> {
+    let rest = tail.strip_prefix(BROKEN_SIXEL_DCS_PREFIX)?;
+    let q = rest.iter().position(|byte| *byte == b'q')?;
+    (q <= 12
+        && rest[..q]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';'))
+    .then_some(BROKEN_SIXEL_DCS_PREFIX.len() + q + 1)
+}
+
+/// A text-caching previewer replaces every `ESC` in a Kitty transmission with the
+/// Unicode replacement character. An introducer alone is not enough: the frame is
+/// only complete once its string-terminator is repaired, otherwise the VT keeps a
+/// partial transmission and never stores a placement.
+const BROKEN_KITTY_TERMINATOR: &[u8] = b"\xef\xbf\xbd\x5c";
+
+/// Repair state across PTY batches: a batch boundary can cut an introducer or a
+/// terminator in half, and `in_graphics` marks the open graphics interval (Kitty
+/// APC or Sixel DCS) whose terminator must be repaired.
+#[derive(Default)]
+pub(crate) struct IntroducerRepairState {
+    fragment: Vec<u8>,
+    in_graphics: bool,
+}
+
+fn looks_like_kitty_metadata(bytes: &[u8]) -> bool {
+    let Some(header_end) = bytes
+        .iter()
+        .position(|byte| *byte == b';')
+        .filter(|end| *end > 0)
+    else {
+        return false;
+    };
+    if header_end > 256 {
+        return false;
+    }
+    bytes[..header_end]
+        .split(|byte| *byte == b',')
+        .all(|field| KITTY_METADATA_KEYS.iter().any(|key| field.starts_with(key)))
+}
+
+/// Repair the introducers and frame terminators of a Kitty transmission that a
+/// text cache mangled, carrying the fragments a batch boundary cut off.
+fn repair_broken_kitty_introducers(bytes: &[u8], state: &mut IntroducerRepairState) -> Vec<u8> {
+    let carried: Vec<u8> = std::mem::take(&mut state.fragment);
+    let source: Vec<u8> = if carried.is_empty() {
+        bytes.to_vec()
+    } else {
+        [carried.as_slice(), bytes].concat()
+    };
+    let source = source.as_slice();
+    let mut out = Vec::with_capacity(source.len());
+    let mut i = 0;
+    while i < source.len() {
+        let tail = &source[i..];
+        if state.in_graphics {
+            if tail.starts_with(BROKEN_KITTY_TERMINATOR) {
+                if crate::logging::graphics_diagnostics_enabled() {
+                    tracing::info!(offset = i, "kitty frame terminator repaired");
+                }
+                out.extend_from_slice(b"\x1b\x5c");
+                i += BROKEN_KITTY_TERMINATOR.len();
+                state.in_graphics = false;
+                continue;
+            }
+            if tail.starts_with(b"\x1b\x5c") {
+                out.extend_from_slice(b"\x1b\x5c");
+                i += 2;
+                state.in_graphics = false;
+                continue;
+            }
+            if BROKEN_KITTY_TERMINATOR.starts_with(tail) {
+                state.fragment.extend_from_slice(tail);
+                break;
+            }
+            out.push(source[i]);
+            i += 1;
+            continue;
+        }
+        let repaired = BROKEN_KITTY_INTRODUCERS.iter().find(|pattern| {
+            tail.starts_with(pattern) && looks_like_kitty_metadata(&tail[pattern.len()..])
+        });
+        if let Some(pattern) = repaired {
+            if crate::logging::graphics_diagnostics_enabled() {
+                tracing::info!(
+                    pattern = pattern.len(),
+                    offset = i,
+                    "kitty introducer repaired"
+                );
+            }
+            out.extend_from_slice(b"\x1b_G");
+            i += pattern.len();
+            state.in_graphics = true;
+            continue;
+        }
+        if let Some(len) = broken_sixel_introducer_len(tail) {
+            if crate::logging::graphics_diagnostics_enabled() {
+                tracing::info!(offset = i, "sixel introducer repaired");
+            }
+            out.extend_from_slice(b"\x1bP");
+            out.extend_from_slice(&tail[BROKEN_SIXEL_DCS_PREFIX.len()..len]);
+            i += len;
+            state.in_graphics = true;
+            continue;
+        }
+        let fragment = INTRODUCER_FRAGMENTS
+            .iter()
+            .find(|pattern| tail.len() < pattern.len() && pattern.starts_with(tail));
+        if let Some(pattern) = fragment {
+            let _ = pattern;
+            // The batch ended inside an introducer; the fragment is inert on its
+            // own and becomes decidable once the next batch arrives.
+            state.fragment.extend_from_slice(tail);
+            break;
+        }
+        out.push(source[i]);
+        i += 1;
+    }
+    out
+}
+
+fn strip_graphics_control_sequences<'a>(
+    bytes: &'a [u8],
+    introducer_repair: &mut IntroducerRepairState,
+) -> std::borrow::Cow<'a, [u8]> {
     let hg = crate::kitty_graphics::host_graphics();
+    if crate::logging::graphics_diagnostics_enabled() && has_kitty_introducer(bytes) {
+        // Diagnostic-only path, enabled with HERDR_GRAPHICS_DEBUG=1: records which
+        // transport decision this batch is about to take, so a real preview run can
+        // be attributed to a layer instead of guessed at.
+        tracing::info!(
+            host_graphics = ?hg,
+            kitty_enabled = crate::kitty_graphics::is_enabled(),
+            sixel_mode = ?crate::sixel::mode(),
+            batch_len = bytes.len(),
+            "graphics transport decision"
+        );
+    }
+    if crate::logging::graphics_diagnostics_enabled() {
+        if let Some(offset) =
+            find_subslice(bytes, b"0;1;0q").or_else(|| find_subslice(bytes, b"1;1;1q"))
+        {
+            // The raster attributes of a Sixel frame survived, so the bytes in
+            // front of them are the DCS introducer as the pane received it.
+            let start = offset.saturating_sub(10);
+            tracing::info!(
+                prefix = hex_bytes(&bytes[start..offset]),
+                offset,
+                batch_len = bytes.len(),
+                host_graphics = ?hg,
+                "sixel raster arrival shape"
+            );
+        }
+    }
+    if crate::logging::graphics_diagnostics_enabled() {
+        if let Some(offset) = find_subslice(bytes, b"a=T,") {
+            // The metadata survived into this batch, so the bytes in front of it
+            // are the introducer as the pane actually received it.
+            let start = offset.saturating_sub(8);
+            let prefix = hex_bytes(&bytes[start..offset]);
+            let header: String = bytes[offset..]
+                .iter()
+                .take(160)
+                .map(|b| {
+                    if (0x20..0x7f).contains(b) {
+                        *b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            tracing::info!(
+                prefix,
+                offset,
+                batch_len = bytes.len(),
+                header,
+                host_graphics = ?hg,
+                kitty_enabled = crate::kitty_graphics::is_enabled(),
+                "kitty metadata arrival shape"
+            );
+        }
+    }
     if hg != crate::kitty_graphics::HostGraphics::Sixel {
         // The default transport forwards the batch untouched: no copy on the hot path.
         return std::borrow::Cow::Borrowed(bytes);
@@ -306,6 +543,8 @@ fn strip_graphics_control_sequences(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> 
     // surface layer repaints them in the one encoding the host understands. Only
     // sequences the VT core cannot parse need removal here.
     let strip_kitty = !crate::kitty_graphics::is_enabled();
+    let repaired = repair_broken_kitty_introducers(bytes, introducer_repair);
+    let bytes = repaired.as_slice();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -1320,6 +1559,7 @@ impl GhosttyPaneTerminal {
             #[cfg(all(test, unix))]
             detection_text_reads: std::sync::atomic::AtomicUsize::new(0),
             core: Mutex::new(GhosttyPaneCore {
+                introducer_repair: IntroducerRepairState::default(),
                 #[cfg(test)]
                 dirty_collection_hook: None,
                 terminal,
@@ -1651,6 +1891,12 @@ impl GhosttyPaneTerminal {
             .collect();
         events.sort_by_key(OrderedColorOrC1Event::end_offset);
 
+        // A text-caching previewer caches previewer output as text, which turns the
+        // introducer and terminator ESC bytes into U+FFFD. The Sixel extractor and
+        // the relay below both read this batch, so repair once before they look.
+        let repaired = repair_broken_kitty_introducers(bytes, &mut core.introducer_repair);
+        let bytes = repaired.as_slice();
+
         // Sixel frames split the stream: the child's raw bytes all reach the
         // parser untouched, but a synthetic cursor advance is injected right
         // after each complete frame so subsequent text starts below the image.
@@ -1672,7 +1918,7 @@ impl GhosttyPaneTerminal {
         if segments.is_empty() {
             // No Sixel frames in this batch; filter graphics control sequences
             // if host_graphics is Sixel.
-            let filtered = strip_graphics_control_sequences(bytes);
+            let filtered = strip_graphics_control_sequences(bytes, &mut core.introducer_repair);
             self.write_pty_bytes_segment(
                 core,
                 filtered.as_ref(),
@@ -1685,6 +1931,13 @@ impl GhosttyPaneTerminal {
 
         let mut events = events.into_iter().peekable();
         let segment_count = segments.len();
+        if crate::logging::graphics_diagnostics_enabled() && segment_count > 0 {
+            tracing::info!(
+                segments = segment_count,
+                batch = bytes.len(),
+                "sixel segments extracted"
+            );
+        }
         for (index, segment) in segments.into_iter().enumerate() {
             let (seg_start, seg_end) = (segment.start, segment.end);
             // M3: a child-initiated screen erase or DECSDM toggle must drop
@@ -1736,7 +1989,7 @@ impl GhosttyPaneTerminal {
             let filtered_bytes = if segment.inject.is_none() {
                 std::borrow::Cow::Owned(segment_bytes.to_vec())
             } else {
-                strip_graphics_control_sequences(segment_bytes)
+                strip_graphics_control_sequences(segment_bytes, &mut core.introducer_repair)
             };
             self.write_pty_bytes_segment(
                 core,
@@ -1755,14 +2008,24 @@ impl GhosttyPaneTerminal {
                     let background = core
                         .initial_default_background
                         .map(|color| [color.r, color.g, color.b, 255]);
-                    if let Some(image_id) = crate::sixel::forward::relay_sixel_frame(
+                    let image_id = crate::sixel::forward::relay_sixel_frame(
                         &mut core.terminal,
                         payload,
                         pixel_height,
                         core.cell_width_px,
                         core.cell_height_px,
                         background,
-                    ) {
+                    );
+                    if crate::logging::graphics_diagnostics_enabled() {
+                        tracing::info!(
+                            payload = payload.len(),
+                            relayed = image_id.is_some(),
+                            pixel_height,
+                            cell = ?(core.cell_width_px, core.cell_height_px),
+                            "sixel relay attempt"
+                        );
+                    }
+                    if let Some(image_id) = image_id {
                         core.sixel_image_ids.push(image_id);
                     }
                 }
@@ -4025,14 +4288,14 @@ mod tests {
         crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
         crate::kitty_graphics::set_enabled(true);
         assert_eq!(
-            strip_graphics_control_sequences(frame).as_ref(),
+            strip_graphics_control_sequences(frame, &mut IntroducerRepairState::default()).as_ref(),
             &frame[..],
             "the VT core parses ESC _ G itself, so the introducer must survive intact"
         );
 
         crate::kitty_graphics::set_enabled(false);
         assert_eq!(
-            strip_graphics_control_sequences(frame).as_ref(),
+            strip_graphics_control_sequences(frame, &mut IntroducerRepairState::default()).as_ref(),
             &b"done"[..],
             "without ingestion the whole transmission is removed"
         );
@@ -4042,12 +4305,168 @@ mod tests {
     }
 
     #[test]
+    fn sixel_transport_repairs_the_capture_of_a_real_previewer_batch() {
+        // The exact shape recorded from a live preview batch: SGR reset, then the
+        // corrupted introducer, full metadata, a zlib+base64 chunk, and ST.
+        let stream = b"25l\xef\xbf\xbd_Ga=T,f=32,s=708,v=252,c=59,r=9,m=1,q=2;aGVsbA==\x1b\\done";
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::kitty_graphics::set_enabled(true);
+        let repaired =
+            strip_graphics_control_sequences(stream, &mut IntroducerRepairState::default());
+        assert!(
+            repaired.starts_with(b"25l\x1b_Ga=T,f=32"),
+            "the real previewer shape is repaired: {:?}",
+            &repaired[..repaired.len().min(24)]
+        );
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+
+    #[test]
+    fn sixel_transport_repairs_the_short_broken_introducer_form() {
+        // A text-caching previewer can lose both the ESC and the `_`, leaving a
+        // replacement character directly in front of the `G`.
+        let broken = "\u{FFFD}Gm=1;aGVsbA==\x1b\\done";
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::kitty_graphics::set_enabled(true);
+        let repaired = strip_graphics_control_sequences(
+            broken.as_bytes(),
+            &mut IntroducerRepairState::default(),
+        );
+        assert!(
+            repaired.starts_with(b"\x1b_Gm=1;"),
+            "the short form is repaired to the introducer the VT core parses: {:?}",
+            &repaired[..repaired.len().min(12)]
+        );
+        assert!(repaired.ends_with(b"done"));
+
+        let text = "note \u{FFFD}Ghello";
+        assert_eq!(
+            strip_graphics_control_sequences(
+                text.as_bytes(),
+                &mut IntroducerRepairState::default()
+            )
+            .as_ref(),
+            text.as_bytes(),
+            "a replacement character before a `G` that does not start metadata is text",
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+
+    #[test]
+    fn sixel_transport_repairs_a_broken_sixel_dcs_introducer() {
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::kitty_graphics::set_enabled(true);
+
+        // A text cache turns the Sixel DCS introducer and terminator into U+FFFD,
+        // so the frame never starts and the relay never sees it.
+        let broken = b"img\xef\xbf\xbdPq#1;100;0;0!20~-@\xef\xbf\xbd\\done";
+        let repaired =
+            strip_graphics_control_sequences(broken, &mut IntroducerRepairState::default());
+        assert!(
+            repaired.starts_with(b"img\x1bPq#1;100;0;0"),
+            "the DCS introducer is restored: {:?}",
+            &repaired[..repaired.len().min(20)]
+        );
+        assert!(
+            repaired.windows(2).any(|pair| pair == b"\x1b\\"),
+            "the frame terminator is restored: {:?}",
+            std::str::from_utf8(&repaired).unwrap_or("<binary>")
+        );
+        assert!(repaired.ends_with(b"done"));
+
+        // The gate is the parameter shape, so ordinary text is untouched.
+        let text = b"note\xef\xbf\xbdPplain\xef\xbf\xbd\\tail";
+        assert_eq!(
+            strip_graphics_control_sequences(text, &mut IntroducerRepairState::default()).as_ref(),
+            text,
+            "U+FFFD before a plain P is text"
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+
+    #[test]
+    fn introducer_repair_spans_a_batch_boundary() {
+        let mut stash = IntroducerRepairState::default();
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::kitty_graphics::set_enabled(true);
+
+        let head = "image:\u{FFFD}_";
+        let head_out = strip_graphics_control_sequences(head.as_bytes(), &mut stash);
+        assert_eq!(
+            head_out.as_ref(),
+            b"image:",
+            "a fragment of an introducer is held back instead of printed"
+        );
+        assert!(
+            !stash.fragment.is_empty(),
+            "the fragment is carried to the next batch"
+        );
+
+        let tail = "Ga=T,f=32,s=6,v=6,c=2,r=1,q=2;aGVsbA==\x1b\\done";
+        let tail_out = strip_graphics_control_sequences(tail.as_bytes(), &mut stash);
+        assert!(
+            tail_out.starts_with(b"\x1b_Ga=T,f=32"),
+            "the joined introducer is repaired: {:?}",
+            &tail_out[..tail_out.len().min(16)]
+        );
+        assert!(tail_out.ends_with(b"done"));
+        assert!(
+            stash.fragment.is_empty(),
+            "a completed introducer leaves nothing held"
+        );
+
+        // An unrelated partial byte is flushed once the next batch rules it out.
+        let mut binary_stash = IntroducerRepairState::default();
+        let partial = strip_graphics_control_sequences(b"bin\xef", &mut binary_stash);
+        assert_eq!(partial.as_ref(), b"bin");
+        let flushed = strip_graphics_control_sequences(b"in", &mut binary_stash);
+        assert_eq!(flushed.as_ref(), b"\xefin");
+        assert!(binary_stash.fragment.is_empty());
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+
+    #[test]
+    fn sixel_transport_repairs_an_introducer_broken_by_text_cache() {
+        // A text-caching previewer writes the introducer's ESC byte as U+FFFD,
+        // which the VT core cannot recognize: the payload would print as text.
+        let broken = "\u{FFFD}_Ga=T,f=32,s=6,v=6,c=2,r=1,q=2;aGVsbA==\x1b\\done";
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::kitty_graphics::set_enabled(true);
+        let repaired = strip_graphics_control_sequences(
+            broken.as_bytes(),
+            &mut IntroducerRepairState::default(),
+        );
+        assert!(
+            repaired.starts_with(b"\x1b_Ga=T,f=32"),
+            "the introducer is restored to the form the VT core parses: {:?}",
+            &repaired[..repaired.len().min(16)]
+        );
+        assert!(
+            repaired.ends_with(b"done"),
+            "surrounding text is preserved: {repaired:?}"
+        );
+
+        let ordinary = "text\u{FFFD}more".as_bytes();
+        assert_eq!(
+            strip_graphics_control_sequences(ordinary, &mut IntroducerRepairState::default())
+                .as_ref(),
+            ordinary,
+            "a replacement character outside an introducer is left alone"
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+
+    #[test]
     fn sixel_transport_strips_the_iterm2_inline_image_osc() {
         let input = b"\x1b]1337;File=size=6;inline=1:aGVsbA==\x1b\\ok";
         crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
         crate::kitty_graphics::set_enabled(true);
         assert_eq!(
-            strip_graphics_control_sequences(input).as_ref(),
+            strip_graphics_control_sequences(input, &mut IntroducerRepairState::default()).as_ref(),
             &b"ok"[..],
             "the VT core has no OSC 1337 parser, so it must not reach the grid"
         );

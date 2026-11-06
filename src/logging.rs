@@ -162,6 +162,22 @@ pub(crate) fn api_wait_timed_out(request_id: &str, pane_id: &str) {
     );
 }
 
+/// True when HERDR_GRAPHICS_DEBUG is present in the environment.
+///
+/// The graphics transport runs per PTY batch and per frame, so its diagnostics
+/// stay behind this cached switch.
+pub(crate) fn graphics_diagnostics_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(2);
+    let cached = CACHED.load(Ordering::Acquire);
+    if cached != 2 {
+        return cached == 1;
+    }
+    let enabled = std::env::var_os("HERDR_GRAPHICS_DEBUG").is_some();
+    CACHED.store(if enabled { 1 } else { 0 }, Ordering::Release);
+    enabled
+}
+
 pub(crate) fn pane_spawn_started(
     pane_id: u32,
     rows: u16,
