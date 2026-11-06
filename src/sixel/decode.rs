@@ -758,6 +758,83 @@ mod tests {
         );
     }
 
+    /// A captured real byte stream: the chafa Sixel frame the project's `scope`
+    /// previewer writes into a pane, recorded from the real chafa run with the
+    /// exact previewer flags, plus the ground-truth pixels an independent decoder
+    /// derived from the same stream. Every painted pixel of Herdr's decode must
+    /// match the ground truth.
+    ///
+    /// The fixture is a good stress case: chafa declares a 60x120 raster in its
+    /// DECGRA but emits only ten bands (60 pixel rows), uses `$` as a carriage
+    /// return inside each band, paints background colours as transparent runs,
+    /// and lets its RLE runs carry the pen past the declared width. Herdr follows
+    /// the standard band semantics, so it reports the height the bands give and
+    /// the width the pen reaches, painting nothing beyond the declared width.
+    #[test]
+    fn captured_chafa_preview_frame_decodes_to_the_ground_truth_pixels() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sixel/");
+        let stream = std::fs::read(format!("{dir}lf_preview_frame.six")).expect("fixture present");
+        // The fixture is chafa's whole stream, cursor control included; the frame
+        // payload is the bytes between the preamble terminator `q` and ST.
+        let q = stream
+            .iter()
+            .position(|byte| *byte == b'q')
+            .expect("preamble terminator");
+        let st = stream[q..]
+            .iter()
+            .position(|byte| *byte == b'\\')
+            .expect("string terminator");
+        let payload = &stream[q + 1..q + 1 + st];
+        // Production computes pixel height from the band count the frame scanner
+        // reports; each band is six pixel rows.
+        let bands = payload.iter().filter(|byte| **byte == b'-').count() + 1;
+        let pixel_height = (bands * 6) as u32;
+        let image = decode_sixel(payload, pixel_height, None).expect("frame decodes");
+        let iw = image.width as usize;
+        let ih = image.height as usize;
+
+        let expected =
+            std::fs::read(format!("{dir}lf_preview_expected.bin")).expect("fixture present");
+        assert_eq!(
+            expected.len(),
+            iw * ih * 4,
+            "the ground truth raster matches Herdr's raster size"
+        );
+        assert_eq!(
+            ih,
+            bands * 6,
+            "the frame paints one band per '-' separator, ten bands = 60 rows"
+        );
+
+        let painted = expected.chunks(4).filter(|p| p[3] == 255).count();
+        assert!(
+            painted > 250,
+            "the fixture has substantial painting: {painted}"
+        );
+
+        for y in 0..ih {
+            for x in 0..iw {
+                let i = (y * iw + x) * 4;
+                let j = (y * iw + x) * 4;
+                assert_eq!(
+                    image.rgba[j..j + 4],
+                    expected[i..i + 4],
+                    "pixel ({x},{y}) differs from the ground truth: herdr {:?} fixture {:?}",
+                    &image.rgba[j..j + 4],
+                    &expected[i..i + 4],
+                );
+            }
+        }
+
+        // Foot grows the image when RLE runs push the pen past the declared width,
+        // so Herdr must report the same extent the data reaches.
+        assert_eq!(
+            (iw, ih),
+            (120, 60),
+            "the pen reaches 120 columns in ten bands"
+        );
+    }
+
     /// A frame that starts a band line with a transparent run (`#0??` before the
     /// first painted column) must keep its width and paint at the right columns.
     /// The leading `?` characters are band data with mask 0, not the graphics-width
