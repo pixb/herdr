@@ -149,9 +149,11 @@ pub(crate) fn decode_sixel(
                 x = 0;
                 i = i.saturating_add(1);
             }
-            b'?' if !drawing => {
+            b'?' if !drawing && payload.get(i + 1).is_some_and(|b| b.is_ascii_digit()) => {
                 // Graphics-width parameter: the scan pass already recorded the
-                // width; skip the digits so they are not read as band data.
+                // width; skip the digits so they are not read as band data. Only a
+                // `?` followed by a digit is a parameter, so a transparent band-data
+                // run keeps the pen where the frame put it.
                 let (_, next) = digits(payload, i + 1);
                 i = next;
             }
@@ -283,11 +285,17 @@ pub(crate) fn scan_pass(payload: &[u8]) -> (usize, bool, bool) {
                 i = next;
             }
             0x3f..=0x7e => {
-                if byte == b'?' && !has_drawing {
+                if byte == b'?'
+                    && !has_drawing
+                    && payload.get(i + 1).is_some_and(|b| b.is_ascii_digit())
+                {
                     // Graphics-width parameter `?<W>;<dir>` (p2 style): the
-                    // image area extends to W pixels. Parameters appear only
-                    // before the first drawing, so skipping the digits keeps
-                    // the width ceiling without losing data runs.
+                    // image area extends to W pixels. A `?` followed by a digit is a
+                    // parameter; a `?` that is not, e.g. the transparent leading run
+                    // `#0??` a colour-band line starts with, is band data with mask 0
+                    // and must advance the pen like any other band character. Treating
+                    // the leading run as a parameter swallows the columns it draws and
+                    // shifts every later band's pen position left.
                     let (graphic_width, next) = digits(payload, i + 1);
                     width = width.max(graphic_width as usize);
                     i = next;
@@ -748,5 +756,48 @@ mod tests {
             decode_sixel(b"#1;100;0;0", 6, None),
             Err(DecodeError::Empty)
         );
+    }
+
+    /// A frame that starts a band line with a transparent run (`#0??` before the
+    /// first painted column) must keep its width and paint at the right columns.
+    /// The leading `?` characters are band data with mask 0, not the graphics-width
+    /// parameter, so treating them as a parameter shifts every later band's pen.
+    #[test]
+    fn leading_transparent_run_is_band_data_not_a_width_parameter() {
+        // Columns 2 and 6 painted, columns 0, 1, 3, 4, 5 transparent.
+        let payload = b"q\"1;1;6;7#3;2;100;0;0#0??#3~#0???#3~$-\\x1b\\";
+        let (width, transparent, drawing) = scan_pass(payload);
+        assert_eq!(width, 7, "width counts the painted columns");
+        assert!(transparent, "transparent background");
+        assert!(drawing, "has drawing data");
+
+        let image = decode_sixel(payload, 6, None).expect("decode");
+        assert_eq!(image.width, 7);
+        // Column 2 paints, columns 0 and 1 stay transparent, column 6 paints.
+        for x in [0usize, 1, 3, 4, 5] {
+            assert_eq!(
+                image.rgba[x * 4 + 3],
+                0,
+                "column {x} must stay transparent, got {:?}",
+                &image.rgba[x * 4..x * 4 + 4]
+            );
+        }
+        for x in [2usize, 6] {
+            assert_eq!(
+                image.rgba[x * 4 + 3],
+                255,
+                "column {x} must paint, got {:?}",
+                &image.rgba[x * 4..x * 4 + 4]
+            );
+            assert_eq!(image.rgba[x * 4], 255, "column {x} red");
+        }
+    }
+
+    /// `?<W>;<dir>` after the preamble still sets the width ceiling.
+    #[test]
+    fn graphics_width_parameter_still_widens_the_frame() {
+        let payload = b"q?40;1#0#1A$-\\x1b\\";
+        let (width, _, _) = scan_pass(payload);
+        assert_eq!(width, 40, "graphics-width parameter widens the image");
     }
 }
