@@ -721,6 +721,16 @@ impl ClientShellState {
             self.hits.popup = None;
         }
         let graphics = self.compose_graphics(layout, &occlusion);
+        if crate::logging::graphics_diagnostics_enabled() && !graphics.is_empty() {
+            let (len, head) = graphics.diagnostics_snapshot(220);
+            let head: String = head.iter().map(|b| format!("{b:02x}")).collect();
+            tracing::info!(
+                subsystem = "client",
+                len,
+                head,
+                "client host graphics bytes"
+            );
+        }
         Some(crate::client::frame_output::ComposedFrame { frame, graphics })
     }
 }

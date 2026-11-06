@@ -370,6 +370,20 @@ fn collect_visible_placements(
                 continue;
             }
         };
+        if crate::logging::graphics_diagnostics_enabled() {
+            let mut probe: Vec<(u32, bool, usize, u32, u32)> = Vec::new();
+            runtime.kitty_image_placements_with_data_filter(|descriptor| {
+                probe.push((
+                    descriptor.image_id,
+                    descriptor.source_file,
+                    descriptor.data_len,
+                    descriptor.image_width,
+                    descriptor.image_height,
+                ));
+                false
+            });
+            tracing::info!(pane = ?info.id, descriptors = ?probe, "pane kitty image descriptors");
+        }
         let mut requested_images = HashSet::new();
         let pane_placements = runtime.kitty_image_placements_with_data_filter(|descriptor| {
             if descriptor.source_file {

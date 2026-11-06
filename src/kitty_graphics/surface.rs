@@ -541,6 +541,15 @@ impl ClientState {
                 .retain(|(id, _)| *id != image_id);
         }
         if !cell_size.is_known() || self.scope.is_empty() {
+            if crate::logging::graphics_diagnostics_enabled() {
+                tracing::info!(
+                    cell_known = cell_size.is_known(),
+                    scope_empty = self.scope.is_empty(),
+                    placements = self.display_scene.placements.len(),
+                    assets = self.assets.len(),
+                    "host graphics output skipped"
+                );
+            }
             self.clear_host_images(&mut bytes);
             let mut output = GraphicsOutput::from_bytes(bytes);
             self.attach_sixel_repaint(&mut output);
@@ -559,6 +568,26 @@ impl ClientState {
         if host_graphics() == HostGraphics::Sixel {
             let mut output = GraphicsOutput::from_bytes(bytes);
             let targets = self.sixel_targets(&visible, cell_size);
+            if crate::logging::graphics_diagnostics_enabled() {
+                tracing::info!(
+                    visible = visible.len(),
+                    targets = targets.len(),
+                    painted_assets = self.assets.len(),
+                    "host sixel paint decision"
+                );
+            }
+            if crate::logging::graphics_diagnostics_enabled() && !targets.is_empty() {
+                tracing::info!(
+                    targets = targets.len(),
+                    cell_width_px = cell_size.width_px,
+                    cell_height_px = cell_size.height_px,
+                    geometry = ?targets
+                        .iter()
+                        .map(|(_, frame, _)| (frame.row, frame.col, frame.cols, frame.rows))
+                        .collect::<Vec<_>>(),
+                    "host sixel paint"
+                );
+            }
             output.extend(self.encode_sixel_frames(targets));
             self.attach_sixel_repaint(&mut output);
             return output;
@@ -714,6 +743,13 @@ pub(crate) fn collect_scene(
     delivered: &DeliveryCache,
     _client_id: u64,
 ) -> (SurfaceGraphicsScene, DeliveryCache, SourceFiles) {
+    if crate::logging::graphics_diagnostics_enabled() {
+        tracing::info!(
+            cell_size = ?cell_size,
+            target = ?surface.target,
+            "client graphics scene inputs"
+        );
+    }
     if !cell_size.is_known() {
         return (
             SurfaceGraphicsScene::default(),
@@ -919,6 +955,16 @@ pub(crate) fn collect_scene(
         )
     });
     sources.retain(|key, _| next.assets.contains(key));
+    if crate::logging::graphics_diagnostics_enabled() {
+        tracing::info!(
+            assets = assets.len(),
+            placements = placements.len(),
+            retained = offscreen.len(),
+            targets = targets.len(),
+            delivered = delivered.assets.len(),
+            "client graphics scene result"
+        );
+    }
     (
         SurfaceGraphicsScene {
             assets,

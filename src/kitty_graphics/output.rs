@@ -47,6 +47,24 @@ impl GraphicsOutput {
         self.operations.is_empty()
     }
 
+    /// Diagnostics-only view: total byte length and a hex prefix of the emitted
+    /// terminal bytes, used to inspect a painted frame during graphics debugging.
+    pub(crate) fn diagnostics_snapshot(&self, limit: usize) -> (usize, Vec<u8>) {
+        let mut total = 0usize;
+        let mut head = Vec::new();
+        for operation in &self.operations {
+            if let GraphicsOperation::Bytes(bytes) = operation {
+                total += bytes.len();
+                let room = limit.saturating_sub(head.len());
+                head.extend(bytes.iter().take(room).copied());
+                if head.len() >= limit {
+                    break;
+                }
+            }
+        }
+        (total, head)
+    }
+
     pub(crate) fn extend(&mut self, other: Self) {
         self.operations.extend(other.operations);
     }
