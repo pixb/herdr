@@ -394,13 +394,19 @@ impl ClientState {
             .collect::<Vec<_>>();
         self.stale_images.extend(unclaimed);
         self.trusted_direct.clear();
-        let placed = scene
+        // The delivery cache also marks offscreen (retained) assets as delivered, so
+        // an asset can arrive in a scene where it has no placement yet. Keeping it is
+        // what makes the later visible placement paintable: the cache will not ship
+        // that key a second time, so dropping it here leaves the placement invisible
+        // forever.
+        let placeable = scene
             .placements
             .iter()
             .map(|placement| placement.asset.clone())
+            .chain(scene.retained_assets.iter().cloned())
             .collect::<HashSet<_>>();
         for asset in std::mem::take(&mut scene.assets) {
-            if asset.data.len() as u64 == asset.key.data_len && placed.contains(&asset.key) {
+            if asset.data.len() as u64 == asset.key.data_len && placeable.contains(&asset.key) {
                 self.assets.insert(asset.key, Arc::from(asset.data));
             }
         }
@@ -1328,6 +1334,63 @@ mod tests {
             assets: vec![asset],
             retained_assets: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_asset_delivered_while_retained_keeps_the_later_placement_paintable() {
+        let mut state = ClientState::default();
+        state.set_scope("endpoint-a:retained-1");
+        let target = SurfaceGraphicsTarget::Pane {
+            pane_id: "w1:p1".into(),
+        };
+        // The delivery cache counts offscreen images as delivered, so the bytes can
+        // arrive in a scene where the image has no placement.
+        state.set_scene(SurfaceGraphicsScene {
+            placements: Vec::new(),
+            assets: vec![asset(target.clone(), 21, vec![9, 8, 7, 6])],
+            retained_assets: vec![asset(target.clone(), 21, vec![9, 8, 7, 6]).key],
+        });
+
+        // The same image becomes visible with no new payload: the cached bytes are
+        // the only source left, because the cache will not ship the key again.
+        state.set_scene(SurfaceGraphicsScene {
+            placements: vec![SurfaceGraphicsPlacement {
+                asset: asset(target, 21, vec![9, 8, 7, 6]).key,
+                logical_placement_id: 3,
+                x: 1,
+                y: 2,
+                cols: 1,
+                rows: 1,
+                source_x: 0,
+                source_y: 0,
+                source_width: 1,
+                source_height: 1,
+                x_offset: 0,
+                y_offset: 0,
+                z: 0,
+                scrollback_offset: 0,
+            }],
+            assets: Vec::new(),
+            retained_assets: Vec::new(),
+        });
+
+        let output = state.encode(
+            Visibility::Main,
+            (10, 5),
+            None,
+            HostCellSize {
+                width_px: 8,
+                height_px: 16,
+            },
+            &Occlusion::default(),
+        );
+        let text = String::from_utf8_lossy(&output).into_owned();
+        // The outer protocol is process-global (Kitty upload, or a painted Sixel
+        // frame), so accept whichever transport is active.
+        assert!(
+            text.contains("a=t,t=d") || text.contains("\x1bP"),
+            "the retained bytes reached the outer terminal: {text}"
+        );
     }
 
     #[test]

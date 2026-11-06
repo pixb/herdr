@@ -16,7 +16,11 @@
 //!   so payloads of unrelated DCS (tmux control mode, termcap replies, …)
 //!   can never be misread as Sixel.
 
-pub(crate) const MAX_SIXEL_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Defensive bound on one Sixel frame's payload text, not a functional limit.
+/// A previewer raster sized to the preview area (a 708x252 px screenshot at
+/// per-pixel color macros) reaches several mebibytes, so the bound sits under the
+/// VT core's 16 MiB APC budget that the relayed image has to fit into anyway.
+pub(crate) const MAX_SIXEL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IGNORED_DCS_BYTES: usize = 16 * 1024 * 1024;
 const SIXEL_BAND_PIXELS: u32 = 6;
 

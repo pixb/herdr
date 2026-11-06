@@ -73,7 +73,15 @@ pub(super) fn current_terminal_geometry_with(
         return Ok((cols, rows, 0, 0, false));
     }
     if let Some((cols, rows, cell_width_px, cell_height_px)) = exact_geometry {
-        return Ok((cols, rows, cell_width_px, cell_height_px, true));
+        // The terminal's own `CSI 6 ; height ; width t` answer describes the cell
+        // pitch it lays out and paints with. An ioctl only divides a pixel extent
+        // by the grid, and terminals report extents measured from font metrics,
+        // so the direct answer wins when the host has given one.
+        let (width_px, height_px) = cell_size_fallback(
+            reported_cell_size.load(Ordering::Acquire),
+            Some((cell_width_px, cell_height_px)),
+        );
+        return Ok((cols, rows, width_px, height_px, true));
     }
     let (cols, rows) = terminal_grid_size()?;
     if !pixel_geometry_fallback {
@@ -239,11 +247,12 @@ const HOST_SCREEN_PIXELS_QUERY: &[u8] = b"\x1b[15t";
 
 /// Cell pitch in the pixel space the terminal paints graphics into.
 ///
-/// `CSI 15 ; height ; width t` reports the screen extent in the device pixels
-/// the terminal composites in, so dividing by the grid yields the pitch a
-/// painted raster must use to cover N cells. `CSI 6 ; height ; width t` reports
-/// the cell size in the terminal's scaled space, which is smaller on a scaled
-/// display, and an ioctl reports the unscaled font metrics.
+/// `CSI 15 ; height ; width t` reports the screen extent in the pixels the
+/// terminal composites into, so dividing by the grid yields the pitch a painted
+/// raster needs to cover N cells. `CSI 6 ; height ; width t` reports the layout
+/// cell pitch, and an ioctl only divides an extent the terminal chose to report,
+/// which foot derives from font metrics. When the host answers both, the derived
+/// pitch wins because it is measured in painted pixels.
 #[cfg(any(unix, test))]
 pub(super) fn device_cell_size(
     reported_screen_pixels: u64,
@@ -274,7 +283,7 @@ pub(super) fn should_query_host_cell_size() -> bool {
 }
 
 pub(super) fn host_cell_size_query_required(needs_pixel_geometry: bool) -> bool {
-    needs_pixel_geometry && should_query_host_cell_size() && ioctl_terminal_geometry().is_none()
+    needs_pixel_geometry && should_query_host_cell_size()
 }
 
 pub(super) fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {

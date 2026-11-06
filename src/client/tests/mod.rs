@@ -547,6 +547,37 @@ fn cell_size_fallback_prefers_reported_then_previous_size() {
 }
 
 #[test]
+fn a_reported_cell_size_overrides_the_ioctl_derived_pitch() {
+    let reported = AtomicU64::new(pack_cell_size(12, 28));
+    let geometry =
+        current_terminal_geometry_with(true, true, &reported, None, Some((80, 24, 8, 19)), || {
+            Ok((80, 24))
+        })
+        .expect("geometry");
+    assert_eq!(
+        geometry,
+        (80, 24, 12, 28, true),
+        "the terminal's own cell pitch is what pane children and painted graphics must agree on"
+    );
+
+    let unanswered = AtomicU64::new(0);
+    let geometry = current_terminal_geometry_with(
+        true,
+        true,
+        &unanswered,
+        None,
+        Some((80, 24, 8, 19)),
+        || Ok((80, 24)),
+    )
+    .expect("geometry");
+    assert_eq!(
+        geometry,
+        (80, 24, 8, 19, true),
+        "an ioctl pitch is still used before the host answers"
+    );
+}
+
+#[test]
 fn painted_cell_size_uses_the_reported_screen_extent() {
     let mut out = Vec::new();
     super::terminal_geometry::write_host_screen_pixels_query(&mut out).unwrap();
