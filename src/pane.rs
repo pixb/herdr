@@ -2539,6 +2539,14 @@ impl PaneRuntime {
                 .enable_kitty_graphics()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
+        if crate::logging::graphics_diagnostics_enabled() {
+            tracing::info!(
+                pane_id = pane_id.raw(),
+                kitty_enabled = crate::kitty_graphics::is_enabled(),
+                host_graphics = ?crate::kitty_graphics::host_graphics(),
+                "pane terminal graphics capability"
+            );
+        }
         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
         let _ = pane_terminal.apply_host_terminal_appearance(host_terminal_appearance);
@@ -2708,6 +2716,14 @@ impl PaneRuntime {
             terminal
                 .enable_kitty_graphics()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        if crate::logging::graphics_diagnostics_enabled() {
+            tracing::info!(
+                pane_id = pane_id.raw(),
+                kitty_enabled = crate::kitty_graphics::is_enabled(),
+                host_graphics = ?crate::kitty_graphics::host_graphics(),
+                "pane terminal graphics capability"
+            );
         }
         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
@@ -4132,6 +4148,165 @@ mod tests {
         assert!(
             text.contains("image:"),
             "surrounding text is still drawn: {text}"
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+
+    #[tokio::test]
+    async fn a_repaired_kitty_transmission_becomes_a_placement_not_grid_text() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        // The shape a text-caching previewer produces: the introducer's ESC byte
+        // arrives as U+FFFD, followed by `_G`, metadata, payload, and ST.
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==")
+            .expect("test png");
+        let payload = STANDARD.encode(&png);
+        let broken_introducer = "\u{FFFD}_G";
+        let frame = format!(
+            "image:{broken_introducer}a=T,f=100,s={},v={},c=4,r=2,q=2,m=0;{payload}\x1b\\",
+            png.len(),
+            png.len()
+        );
+
+        crate::kitty_graphics::set_enabled(true);
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"prompt");
+        runtime.test_process_pty_bytes(frame.as_bytes());
+
+        assert!(
+            runtime.kitty_graphics_may_have_placements(),
+            "the repaired introducer reached the graphics parser"
+        );
+        let placements = runtime.kitty_image_placements_with_data_filter(|_| true);
+        assert!(
+            !placements.is_empty(),
+            "the VT core stored a placement for the repaired transmission"
+        );
+        let text = runtime.detection_text();
+        assert!(
+            !text.contains("a=T") && !text.contains(&payload),
+            "the transmission stayed out of the grid: {text}"
+        );
+        assert!(
+            text.contains("image:"),
+            "surrounding text is still drawn: {text}"
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+    #[tokio::test]
+    async fn a_repaired_kitty_transmission_with_a_broken_terminator_becomes_a_placement() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        // A text cache mangles every ESC in the transmission, so both the
+        // introducer and the frame terminator arrive as U+FFFD. A repaired
+        // introducer alone leaves the transmission open and the VT stores nothing.
+        let png = STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==")
+            .expect("test png");
+        let payload = STANDARD.encode(&png);
+        let frame = format!(
+            "image:\u{FFFD}_Ga=T,f=100,s={},v={},c=4,r=2,q=2,m=0;{payload}\u{FFFD}\\",
+            png.len(),
+            png.len()
+        );
+
+        crate::kitty_graphics::set_enabled(true);
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"prompt");
+        runtime.test_process_pty_bytes(frame.as_bytes());
+
+        let placements = runtime.kitty_image_placements_with_data_filter(|_| true);
+        assert!(
+            !placements.is_empty(),
+            "the repaired terminator closed the transmission"
+        );
+        let text = runtime.detection_text();
+        assert!(
+            !text.contains("a=T") && !text.contains(&payload),
+            "the transmission stayed out of the grid: {text}"
+        );
+        assert!(
+            text.contains("image:"),
+            "surrounding text is still drawn: {text}"
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+    #[tokio::test]
+    async fn a_repaired_sixel_frame_becomes_a_placement_not_grid_text() {
+        // The relay path is the working transport for a host that paints Sixel, and
+        // a text-caching previewer breaks the Sixel DCS introducer the same way it
+        // breaks a Kitty introducer.
+        let frame = "image:\u{FFFD}Pq#1;100;0;0!20~-@\u{FFFD}\\done";
+
+        crate::kitty_graphics::set_enabled(true);
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::sixel::set_mode(None);
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"prompt");
+        runtime.test_process_pty_bytes(frame.as_bytes());
+
+        let placements = runtime.kitty_image_placements_with_data_filter(|_| true);
+        assert!(
+            !placements.is_empty(),
+            "the repaired Sixel frame relayed into a placement"
+        );
+        let text = runtime.detection_text();
+        assert!(
+            !text.contains("#1;100"),
+            "the Sixel payload stayed out of the grid: {text}"
+        );
+        assert!(
+            text.contains("image:") && text.contains("done"),
+            "surrounding text is still drawn: {text}"
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+    }
+    #[tokio::test]
+    async fn a_previewer_sized_sixel_frame_above_one_mebibyte_is_relayed() {
+        // A previewer raster sized to the preview area is a few mebibytes of Sixel
+        // text; dropping it silently is what made real previews show nothing.
+        // Per-pixel color selection is what previewers emit; it makes the payload
+        // text an order of magnitude larger than the raster it encodes.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"\x1bPq");
+        for _ in 0..252 {
+            for _ in 0..708 {
+                frame.extend_from_slice(b"#1;100;0;0~");
+            }
+            frame.push(b'-');
+        }
+        frame.extend_from_slice(b"\x1b\\preview");
+        assert!(
+            frame.len() > 1024 * 1024,
+            "the fixture must clear the old one-mebibyte bound: {}",
+            frame.len()
+        );
+
+        crate::kitty_graphics::set_enabled(true);
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::sixel::set_mode(None);
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"prompt");
+        runtime.test_process_pty_bytes(&frame);
+
+        let placements = runtime.kitty_image_placements_with_data_filter(|_| true);
+        assert!(
+            !placements.is_empty(),
+            "a previewer-sized frame relays into a placement"
+        );
+        let text = runtime.detection_text();
+        assert!(
+            !text.contains("#1;100"),
+            "the Sixel payload stayed out of the grid: {text}"
+        );
+        assert!(
+            text.contains("preview"),
+            "text after the frame is still drawn: {text}"
         );
 
         crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);

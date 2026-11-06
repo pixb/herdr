@@ -199,6 +199,16 @@ fn apply_painted_cell_size(
         u32::from(state.reported_size.1),
         fallback,
     );
+    if crate::logging::graphics_diagnostics_enabled() {
+        tracing::info!(
+            subsystem = "client",
+            device_px = reported_screen_pixels.load(Ordering::Acquire),
+            grid = ?(state.reported_size.0, state.reported_size.1),
+            fallback = ?fallback,
+            painted = ?(width_px, height_px),
+            "client painted cell pitch resolved"
+        );
+    }
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(width_px, height_px);
     }
