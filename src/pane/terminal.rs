@@ -4304,6 +4304,87 @@ mod tests {
         crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
     }
 
+    /// End-to-end on captured bytes: one real preview batch as a pane PTY
+    /// received it (lf's preview text, lf's own Kitty transmission with its
+    /// introducer *and* terminator mangled by its text cache, then the previewer's
+    /// chafa Sixel frame from pane stderr). The pane pipeline must repair the
+    /// mangled transmission, extract the previewer frame, and decode it to the
+    /// pixels an independent decoder derived from the same bytes, because that is
+    /// the data the relay hands to the outer-terminal painter.
+    #[test]
+    fn captured_previewer_batch_repairs_and_extracts_the_frame_the_relay_needs() {
+        let _guard = sixel_mode_test_lock();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sixel/");
+        let batch = std::fs::read(format!("{dir}lf_preview_batch.bin")).expect("fixture present");
+
+        // Captured state: nothing in the batch looks like a graphics frame, so a
+        // pipeline without repair sees only text.
+        assert!(
+            batch.windows(5).any(|w| w == b"\xef\xbf\xbd_G"),
+            "the fixture carries the broken introducer a text-caching previewer emits"
+        );
+        assert!(
+            batch.windows(4).any(|w| w == b"\xef\xbf\xbd\x5c"),
+            "the fixture carries the broken string terminator"
+        );
+
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Sixel);
+        crate::kitty_graphics::set_enabled(true);
+        let repaired =
+            repair_broken_kitty_introducers(&batch, &mut IntroducerRepairState::default());
+        crate::kitty_graphics::set_host_graphics(crate::kitty_graphics::HostGraphics::Kitty);
+
+        assert_eq!(
+            repaired.windows(3).filter(|w| w == b"\x1b\x5f\x47").count(),
+            1,
+            "the mangled introducer must become the introducer the VT core parses"
+        );
+        assert!(
+            repaired.windows(2).any(|w| w == b"\x1b\x5c"),
+            "the mangled terminator must become string terminator"
+        );
+        assert!(
+            repaired.windows(2).any(|w| w == b"\x1b\x50"),
+            "the previewer's Sixel device control string is untouched"
+        );
+
+        let mut extractor = crate::sixel::extractor::SixelExtractor::default();
+        let mut frames = Vec::new();
+        extractor.feed(&repaired, &mut frames);
+        assert_eq!(
+            frames.len(),
+            1,
+            "the previewer's frame completes inside the batch"
+        );
+        let frame = &frames[0];
+        let image = crate::sixel::decode::decode_sixel(&frame.payload, frame.pixel_height, None)
+            .expect("the previewer frame decodes");
+        let iw = image.width as usize;
+        let ih = image.height as usize;
+        assert_eq!(
+            (iw, ih),
+            (120, 60),
+            "the frame reaches the extent chafa emits"
+        );
+
+        let expected =
+            std::fs::read(format!("{dir}lf_preview_expected.bin")).expect("fixture present");
+        assert_eq!(expected.len(), iw * ih * 4, "ground truth raster size");
+        for y in 0..ih {
+            for x in 0..iw {
+                let i = (y * iw + x) * 4;
+                assert_eq!(
+                    image.rgba[i..i + 4],
+                    expected[i..i + 4],
+                    "pixel ({x},{y}) from the repaired batch differs from the ground truth: \
+                     pane {:?} fixture {:?}",
+                    &image.rgba[i..i + 4],
+                    &expected[i..i + 4],
+                );
+            }
+        }
+    }
+
     #[test]
     fn sixel_transport_repairs_the_capture_of_a_real_previewer_batch() {
         // The exact shape recorded from a live preview batch: SGR reset, then the

@@ -325,19 +325,25 @@ mod tests {
         };
         let spec = env.to_string_lossy().to_string();
         let solid = spec.strip_prefix("solid:");
-        let spec = solid.unwrap_or(&spec);
+        let pattern = spec.strip_prefix("pattern:");
+        let spec = solid.unwrap_or(pattern.unwrap_or(&spec));
         let (width, height): (usize, u32) = match spec.split_once('x') {
             Some((w, h)) => (w.parse().unwrap_or(24), h.parse().unwrap_or(12)),
             None => (24, 12),
         };
         let height = height as usize;
-        let rgba = if solid.is_some() {
+        let rgba = if let Some(solid) = solid {
+            let _ = solid;
             solid_rgba(width, height, 255, 0, 255)
+        } else if pattern.is_some() {
+            pattern_rgba(width, height)
         } else {
             rgba_pattern(width, height)
         };
         let payload = encode_frame(&rgba, width, height, width, height);
         println!("payload: {}", String::from_utf8_lossy(&payload));
+        let (scan_w, transparent, drawing) = crate::sixel::decode::scan_pass(&payload);
+        println!("scan width={scan_w} transparent={transparent} drawing={drawing}");
 
         let decoded = decode_sixel(&payload, height as u32, None).unwrap();
         for y in 0..height {
@@ -638,6 +644,170 @@ mod tests {
         );
     }
 
+    /// Encode real RGBA, decode with Herdr's decoder, and compare every pixel.
+    ///
+    /// The encoder writes quantized cube colours (`quantize` then `cube_percent`),
+    /// so a decoded pixel is the quantized value, not the original: this test pins
+    /// that the decoder reproduces exactly what the encoder wrote, pixel by pixel,
+    /// for a pattern with many registers and RLE runs of every length.
+    /// Encode real RGBA, decode with Herdr's decoder, and compare every pixel.
+    ///
+    /// The encoder writes quantized cube colours (`quantize` then `cube_percent`),
+    /// so a decoded pixel is the quantized value, not the original: this test pins
+    /// that the decoder reproduces exactly what the encoder wrote, pixel by pixel,
+    /// for a pattern with many registers and RLE runs of every length.
+    #[test]
+    fn frame_round_trips_pixel_for_pixel() {
+        let width = 100usize;
+        let height = 24usize;
+        let rgba = pattern_rgba(width, height);
+        let payload = encode_frame(&rgba, width, height, width, height);
+        let decoded = decode_sixel(&payload, height as u32, None).expect("frame decodes");
+        assert_eq!(
+            (decoded.width as usize, decoded.height as usize),
+            (width, height)
+        );
+
+        // A channel the encoder quantizes lands at `cube_percent(level) * 255 / 100`,
+        // which is exactly `level * 51`.
+        let want = |value: u8| (quantize(value) * 51) as u8;
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 4;
+                assert_eq!(
+                    decoded.rgba[i + 3],
+                    255,
+                    "pixel ({x},{y}) must be opaque, source rgba {src:?}",
+                    src = &rgba[i..i + 4]
+                );
+                for channel in 0usize..3 {
+                    assert_eq!(
+                        decoded.rgba[i + channel],
+                        want(rgba[i + channel]),
+                        "pixel ({x},{y}) channel {channel}: source {} decoded {}",
+                        rgba[i + channel],
+                        decoded.rgba[i + channel],
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same pixel-for-pixel round trip on a frame with transparent pixels:
+    /// the encoder omits them, the decoder must leave them transparent, and the
+    /// painted pixels must still land at their exact columns.
+    #[test]
+    fn round_trip_keeps_transparency_and_columns() {
+        let width = 40usize;
+        let height = 12usize;
+        let mut rgba = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                if x % 4 < 2 {
+                    // A transparent stripe every four columns.
+                    rgba.extend([0, 0, 0, 0]);
+                } else {
+                    rgba.extend([
+                        (x * 7 % 256) as u8,
+                        (y * 11 % 256) as u8,
+                        ((x + y) * 13 % 256) as u8,
+                        255,
+                    ]);
+                }
+            }
+        }
+        let payload = encode_frame(&rgba, width, height, width, height);
+        let decoded = decode_sixel(&payload, height as u32, None).expect("frame decodes");
+        assert_eq!(
+            (decoded.width as usize, decoded.height as usize),
+            (width, height)
+        );
+
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 4;
+                if rgba[i + 3] == 0 {
+                    assert_eq!(
+                        decoded.rgba[i + 3],
+                        0,
+                        "transparent pixel ({x},{y}) must stay transparent"
+                    );
+                } else {
+                    assert_eq!(decoded.rgba[i + 3], 255, "pixel ({x},{y}) must be opaque");
+                    for channel in 0usize..3 {
+                        assert_eq!(
+                            decoded.rgba[i + channel],
+                            (quantize(rgba[i + channel]) * 51) as u8,
+                            "pixel ({x},{y}) channel {channel} round trip"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Round trip the pixels Herdr decodes from the captured chafa preview frame:
+    /// re-encode them with Herdr's encoder, decode again, and compare pixel by
+    /// pixel. This proves the encoder and decoder agree on real previewer data,
+    /// including the transparent background runs chafa emits for background colours.
+    #[test]
+    fn captured_preview_frame_reencodes_to_the_same_pixels() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sixel/");
+        let stream = std::fs::read(format!("{dir}lf_preview_frame.six")).expect("fixture present");
+        let q = stream
+            .iter()
+            .position(|byte| *byte == b'q')
+            .expect("preamble terminator");
+        let st = stream[q..]
+            .iter()
+            .position(|byte| *byte == b'\\')
+            .expect("string terminator");
+        let payload = &stream[q + 1..q + 1 + st];
+        let bands = payload.iter().filter(|byte| **byte == b'-').count() + 1;
+        let image = decode_sixel(payload, (bands * 6) as u32, None).expect("frame decodes");
+
+        let iw = image.width as usize;
+        let ih = image.height as usize;
+        let payload = encode_frame(&image.rgba, iw, ih, iw, ih);
+        let again = decode_sixel(&payload, image.height, None).expect("re-encoded frame decodes");
+        assert_eq!((again.width, again.height), (image.width, image.height));
+
+        // The encoder writes colors as 6x6x6 cube percentages, so a second pass
+        // quantizes chafa's colors to the nearest cube level. Alpha is preserved
+        // exactly: transparent pixels stay transparent, painted pixels stay opaque.
+        let quantized = |v: u8| -> u8 {
+            let level = (v as u16 + 25) / 51;
+            (level * 20 * 255 / 100) as u8
+        };
+        let painted_first = image.rgba.chunks(4).filter(|p| p[3] == 255).count();
+        assert!(
+            painted_first > 250,
+            "real previewer data paints {painted_first}"
+        );
+        for i in 0..(iw * ih) {
+            let x = i % iw;
+            let y = i / iw;
+            let first = &image.rgba[i * 4..i * 4 + 4];
+            let second = &again.rgba[i * 4..i * 4 + 4];
+            assert_eq!(
+                second[3], first[3],
+                "alpha must survive the round trip at ({x},{y})"
+            );
+            assert_eq!(
+                second,
+                [
+                    quantized(first[0]),
+                    quantized(first[1]),
+                    quantized(first[2]),
+                    first[3]
+                ],
+                "pixel ({x},{y}) must land on the 6x6x6 cube: first pass {:?} second pass {:?}",
+                first,
+                second,
+            );
+        }
+    }
+
     #[test]
     fn decgra_declares_the_vertical_extent_before_the_horizontal_extent() {
         let rgba = rgba_pattern(20, 6);
@@ -661,6 +831,25 @@ mod tests {
             } else {
                 rgba.extend(register_rgb(idx));
                 rgba.push(255);
+            }
+        }
+        rgba
+    }
+
+    /// Three vertical colour blocks plus a brightness ramp: many registers and
+    /// RLE runs of every length, with the same colour repeating in a band, and the
+    /// blocks rotated by row so band lines differ between rows.
+    fn pattern_rgba(width: usize, height: usize) -> Vec<u8> {
+        let mut rgba = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let base: (u8, u8, u8) = match (x + y) % 3 {
+                    0 => (200, 30, 30),
+                    1 => (30, 160, 30),
+                    _ => (30, 30, 200),
+                };
+                let ramp = (x * 24 / width) as u8;
+                rgba.extend([base.0 + ramp, base.1 + ramp, base.2 + ramp, 255]);
             }
         }
         rgba
