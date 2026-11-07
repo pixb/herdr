@@ -6,7 +6,7 @@
 //! * the P1 header uses the 12-parameter DEC layout terminals parse, with the
 //!   grid, the aspect ratio overrides and the graphic rectangle left neutral,
 //!   and a transparent background,
-//! * the raster attributes declare the frame size with DECGRA (`"1;1;H;W`),
+//! * the raster attributes declare the frame size with DECGRA (`"1;1;W;H`),
 //! * every colour the frame paints is defined with explicit percent RGB
 //!   (`#Pc;2;R;G;B`) before it is selected, because a terminal's Sixel palette
 //!   is not guaranteed to contain the DEC 6x6x6 cube: Foot preloads only the
@@ -250,13 +250,14 @@ fn frame_header() -> Vec<u8> {
     b"\x1bP0;1;0;0;1;1;0;0;0;0;0;0q".to_vec()
 }
 
-/// DECGRA raster attributes: `PAN;PAD;V;H` with square pixels and the vertical
-/// extent before the horizontal extent, which is the order foot and xterm parse
-/// (`pan;pad;pixel vertical extent;pixel horizontal extent`). Declaring them the
-/// other way round makes the terminal preallocate a transposed raster buffer.
-/// `PAD == 1` keeps foot on its 1:1 put handler.
+/// DECGRA raster attributes: `PAN;PAD;W;H` with square pixels and the horizontal
+/// extent before the vertical extent, the order DEC defines and chafa, foot,
+/// xterm and libsixel all parse (`pan;pad;pixel horizontal extent;pixel vertical
+/// extent`). Declaring them the other way round makes the terminal preallocate a
+/// transposed raster buffer, so a frame wider than it is tall is clipped to a
+/// thin strip. `PAD == 1` keeps foot on its 1:1 put handler.
 fn raster_attributes(width: usize, height: usize) -> Vec<u8> {
-    format!("\"1;1;{height};{width}").into_bytes()
+    format!("\"1;1;{width};{height}").into_bytes()
 }
 
 /// Encodes `src` scaled to `dst_width` by `dst_height` as one self-contained
@@ -809,17 +810,17 @@ mod tests {
     }
 
     #[test]
-    fn decgra_declares_the_vertical_extent_before_the_horizontal_extent() {
+    fn decgra_declares_the_horizontal_extent_before_the_vertical_extent() {
         let rgba = rgba_pattern(20, 6);
         let payload = encode_frame(&rgba, 20, 6, 20, 6);
         let body = String::from_utf8_lossy(&payload);
         assert!(
-            body.contains("\"1;1;6;20"),
-            "a 20x6 frame declares the 6px vertical extent then the 20px horizontal extent, the order foot and xterm parse: {body}"
+            body.contains("\"1;1;20;6"),
+            "a 20x6 frame declares the 20px horizontal extent then the 6px vertical extent, the order chafa, foot, xterm and libsixel parse: {body}"
         );
         assert!(
-            !body.contains("\"1;1;20;6"),
-            "the extent is never declared width first, which makes the terminal preallocate a transposed raster: {body}"
+            !body.contains("\"1;1;6;20"),
+            "the extent is never declared height first, which makes the terminal preallocate a transposed raster and clip a wide frame to a strip: {body}"
         );
     }
 
