@@ -124,14 +124,17 @@ pub(super) fn setup_terminal_with_capabilities(
 
     execute!(io::stdout(), DisableLineWrap)?;
 
-    // Sixel paints over the text cells it covers. Sixel Display Mode (DECSDM)
-    // stops a frame from scrolling the screen, which is the only mode where
-    // painting a pane image at a grid position keeps the layout intact.
+    // Sixel paints over the text cells it covers. Keep DECSDM (Sixel Display
+    // Mode) reset so the terminal anchors the frame at the cursor position we
+    // emit: foot pins a DECSDM frame to the screen origin and ignores the
+    // cursor, which would drop pane images in the top-left corner. Scrolling
+    // mode does not push rows down for a frame that fits inside its pane, so
+    // forcing it here is safe and also clears state left by a previous crash.
     if enable_client_protocols
         && crate::kitty_graphics::host_graphics() == crate::kitty_graphics::HostGraphics::Sixel
     {
         terminal_guard.reset_sixel_display_mode = true;
-        io::stdout().write_all(b"\x1b[?80h")?;
+        io::stdout().write_all(b"\x1b[?80l")?;
         io::stdout().flush()?;
     }
 
@@ -155,7 +158,7 @@ pub(super) struct TerminalGuard {
     /// The modifyOtherKeys sequence written at setup, re-sent on refresh.
     modify_other_keys_sequence: Option<&'static [u8]>,
     reset_host_color_scheme_reports: bool,
-    /// Sixel Display Mode was enabled for sixel host graphics.
+    /// Sixel scrolling mode was forced for sixel host graphics.
     reset_sixel_display_mode: bool,
     restore_claimed: Arc<AtomicBool>,
     restored: bool,
