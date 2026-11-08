@@ -25,6 +25,12 @@ pub(crate) fn verify_sha256(path: &Path, expected: &str) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn bytes_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    to_lower_hex(&hasher.finalize())
+}
+
 pub(crate) fn file_sha256(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();

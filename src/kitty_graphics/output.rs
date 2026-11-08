@@ -47,22 +47,20 @@ impl GraphicsOutput {
         self.operations.is_empty()
     }
 
-    /// Diagnostics-only view: total byte length and a hex prefix of the emitted
-    /// terminal bytes, used to inspect a painted frame during graphics debugging.
-    pub(crate) fn diagnostics_snapshot(&self, limit: usize) -> (usize, Vec<u8>) {
-        let mut total = 0usize;
-        let mut head = Vec::new();
+    /// Diagnostics-only: serialize every operation exactly as the client writes
+    /// it, including Kitty uploads, so a debug run can export the complete host
+    /// byte stream instead of a truncated prefix.
+    pub(crate) fn diagnostics_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
         for operation in &self.operations {
-            if let GraphicsOperation::Bytes(bytes) = operation {
-                total += bytes.len();
-                let room = limit.saturating_sub(head.len());
-                head.extend(bytes.iter().take(room).copied());
-                if head.len() >= limit {
-                    break;
+            match operation {
+                GraphicsOperation::Bytes(next) => bytes.extend_from_slice(next),
+                GraphicsOperation::Upload { control, data } => {
+                    super::encode_kitty_data(&mut bytes, control, data);
                 }
             }
         }
-        (total, head)
+        bytes
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
@@ -105,6 +103,28 @@ mod tests {
         super::super::encode_kitty_data(&mut expected, control, &data);
         expected.extend_from_slice(b"after");
         assert_eq!(output.into_inline_bytes(), expected);
+    }
+
+    #[test]
+    fn diagnostics_bytes_serializes_the_complete_output() {
+        let data: Arc<[u8]> = Arc::from(vec![7; super::super::KITTY_CHUNK_BYTES + 1]);
+        let control = "a=t,t=d,f=24,s=1,v=1,i=9,q=2";
+        let mut output = GraphicsOutput::default();
+        output.extend(GraphicsOutput::from_bytes(vec![b'x'; 4096]));
+        output.operations.push(GraphicsOperation::Upload {
+            control: control.into(),
+            data: Arc::clone(&data),
+        });
+        output.extend(GraphicsOutput::from_bytes(b"tail".to_vec()));
+        let mut expected = vec![b'x'; 4096];
+        super::super::encode_kitty_data(&mut expected, control, &data);
+        expected.extend_from_slice(b"tail");
+        let dumped = output.diagnostics_bytes();
+        assert_eq!(dumped, expected);
+        assert!(
+            dumped.len() > 220,
+            "diagnostics must not truncate the painted stream"
+        );
     }
 
     #[test]

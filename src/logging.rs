@@ -178,6 +178,19 @@ pub(crate) fn graphics_diagnostics_enabled() -> bool {
     enabled
 }
 
+/// Destination for the complete host graphics byte stream when
+/// `HERDR_GRAPHICS_DUMP` is set. `1` or an empty value selects the default file
+/// in the Herdr data directory; anything else is treated as a path.
+pub(crate) fn graphics_dump_path() -> Option<PathBuf> {
+    let value = std::env::var_os("HERDR_GRAPHICS_DUMP")?;
+    let raw = value.to_string_lossy();
+    if raw.is_empty() || raw == "1" {
+        Some(crate::session::data_dir().join("herdr-graphics.bin"))
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
 pub(crate) fn pane_spawn_started(
     pane_id: u32,
     rows: u16,

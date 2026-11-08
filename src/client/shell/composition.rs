@@ -722,17 +722,42 @@ impl ClientShellState {
         }
         let graphics = self.compose_graphics(layout, &occlusion);
         if crate::logging::graphics_diagnostics_enabled() && !graphics.is_empty() {
-            let (len, head) = graphics.diagnostics_snapshot(220);
-            let head: String = head.iter().map(|b| format!("{b:02x}")).collect();
-            tracing::info!(
-                subsystem = "client",
-                len,
-                head,
-                "client host graphics bytes"
-            );
+            export_graphics_diagnostics(&graphics);
         }
         Some(crate::client::frame_output::ComposedFrame { frame, graphics })
     }
+}
+
+/// Exports the complete graphics byte stream the client is about to write, so a
+/// `HERDR_GRAPHICS_DEBUG` run can inspect the exact frame instead of a prefix.
+fn export_graphics_diagnostics(graphics: &crate::kitty_graphics::GraphicsOutput) {
+    let bytes = graphics.diagnostics_bytes();
+    let head: String = bytes.iter().take(48).map(|b| format!("{b:02x}")).collect();
+    let tail: String = bytes[bytes.len().saturating_sub(48)..]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let sha256 = crate::checksum::bytes_sha256(&bytes);
+    let dump_path = crate::logging::graphics_dump_path();
+    if let Some(path) = dump_path.as_deref() {
+        if let Err(err) = std::fs::write(path, &bytes) {
+            tracing::warn!(
+                subsystem = "client",
+                path = %path.display(),
+                error = %err,
+                "client host graphics dump failed"
+            );
+        }
+    }
+    tracing::info!(
+        subsystem = "client",
+        len = bytes.len(),
+        sha256 = %sha256,
+        head,
+        tail,
+        dump = ?dump_path,
+        "client host graphics bytes"
+    );
 }
 
 fn client_copy_surface_coherent(copy_mode: Option<&ClientCopyModeState>, hit: &PaneHit) -> bool {
