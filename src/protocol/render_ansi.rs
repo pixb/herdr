@@ -44,12 +44,48 @@ pub(crate) fn final_sync_output_end(bytes: &[u8]) -> Option<usize> {
         .rposition(|window| window == SYNC_OUTPUT_END)
 }
 
+/// Cell rectangle of the cells a blit write touched, half-open `[left, right) x [top, bottom)`.
+///
+/// Sixel host graphics have no erase, so a painted frame survives only until some later
+/// write touches its cells. The client intersects these bounds with the painted frames to
+/// know when a frame must be re-emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChangedBounds {
+    pub(crate) left: u16,
+    pub(crate) top: u16,
+    pub(crate) right: u16,
+    pub(crate) bottom: u16,
+}
+
+impl ChangedBounds {
+    fn extended(mut self, x: u16, y: u16, width: u16) -> Self {
+        self.left = self.left.min(x);
+        self.top = self.top.min(y);
+        self.right = self.right.max(x.saturating_add(width));
+        self.bottom = self.bottom.max(y.saturating_add(1));
+        self
+    }
+
+    /// True when the half-open rectangle `[col, col + cols) x [row, row + rows)` intersects.
+    pub(crate) fn touches_cells(&self, col: u16, row: u16, cols: u32, rows: u32) -> bool {
+        let right = col.saturating_add(u16::try_from(cols).unwrap_or(u16::MAX));
+        let bottom = row.saturating_add(u16::try_from(rows).unwrap_or(u16::MAX));
+        col < self.right && right > self.left && row < self.bottom && bottom > self.top
+    }
+
+    fn is_empty(&self) -> bool {
+        self.left >= self.right || self.top >= self.bottom
+    }
+}
+
 /// Bytes produced by a [`BlitEncoder`] for one terminal frame.
 pub(crate) struct EncodedBlit {
     /// Terminal escape bytes ready to write to the host terminal.
     pub(crate) bytes: Vec<u8>,
     /// Whether this frame was encoded as a full redraw.
     pub(crate) full: bool,
+    /// Cells this blit wrote, tracked only when the caller asked for it.
+    pub(crate) changed: Option<ChangedBounds>,
     next_last_visible_cursor: Option<(u16, u16)>,
     next_last_cursor_shape: u8,
     suppress_visible_cursor: bool,
@@ -70,21 +106,45 @@ impl BlitEncoder {
     }
 
     pub(crate) fn encode(&self, frame: &FrameData, repaint: bool) -> EncodedBlit {
-        self.encode_inner(frame, repaint, false)
+        self.encode_inner(frame, repaint, false, false)
     }
 
+    /// Encodes a frame and reports which cells the write touched.
+    ///
+    /// The caller pays for bounds tracking only when host graphics need it.
+    pub(crate) fn encode_tracking(
+        &self,
+        frame: &FrameData,
+        repaint: bool,
+        track_changed: bool,
+    ) -> EncodedBlit {
+        self.encode_inner(frame, repaint, track_changed, false)
+    }
+
+    /// Test-only convenience wrapper over the untracked suppress path.
+    #[cfg(test)]
     pub(crate) fn encode_with_suppressed_visible_cursor(
         &self,
         frame: &FrameData,
         repaint: bool,
     ) -> EncodedBlit {
-        self.encode_inner(frame, repaint, true)
+        self.encode_inner(frame, repaint, false, true)
+    }
+
+    pub(crate) fn encode_with_suppressed_visible_cursor_tracking(
+        &self,
+        frame: &FrameData,
+        repaint: bool,
+        track_changed: bool,
+    ) -> EncodedBlit {
+        self.encode_inner(frame, repaint, track_changed, true)
     }
 
     fn encode_inner(
         &self,
         frame: &FrameData,
         repaint: bool,
+        track_changed: bool,
         suppress_visible_cursor: bool,
     ) -> EncodedBlit {
         let previous_frame = self.last_frame.as_ref();
@@ -99,7 +159,7 @@ impl BlitEncoder {
         let mut bytes = Vec::new();
         let mut next_last_visible_cursor = self.last_visible_cursor;
         let mut next_last_cursor_shape = self.last_cursor_shape;
-        blit_frame_to_with_cursor_memory_and_clear_policy(
+        let changed = blit_frame_to_with_cursor_memory_and_clear_policy(
             &mut bytes,
             frame,
             prev,
@@ -108,6 +168,7 @@ impl BlitEncoder {
             repeat_ime_anchor_after_sync(),
             clear_before_full_redraw,
             suppress_visible_cursor,
+            track_changed,
         );
         if let Some(stats) = prof_stats {
             crate::render_prof::duration_since("ansi_encode.total", prof_started);
@@ -124,6 +185,9 @@ impl BlitEncoder {
         EncodedBlit {
             bytes,
             full,
+            changed: track_changed
+                .then_some(changed)
+                .filter(|bounds| !bounds.is_empty()),
             next_last_visible_cursor,
             next_last_cursor_shape,
             suppress_visible_cursor,
@@ -141,11 +205,23 @@ impl BlitEncoder {
         self.last_frame.as_ref() == Some(frame)
     }
 
+    /// Test-only convenience wrapper over the untracked patch path.
+    #[cfg(test)]
     pub(crate) fn encode_patch(
         &self,
         rows: &[PaneSurfacePatchRow],
         cursor: Option<CursorState>,
         suppress_visible_cursor: bool,
+    ) -> Option<EncodedBlit> {
+        self.encode_patch_tracking(rows, cursor, suppress_visible_cursor, false)
+    }
+
+    pub(crate) fn encode_patch_tracking(
+        &self,
+        rows: &[PaneSurfacePatchRow],
+        cursor: Option<CursorState>,
+        suppress_visible_cursor: bool,
+        track_changed: bool,
     ) -> Option<EncodedBlit> {
         let frame = self.last_frame.as_ref()?;
         if rows.iter().any(|row| !patch_row_fits(frame, row)) || patch_rows_overlap(rows) {
@@ -159,6 +235,7 @@ impl BlitEncoder {
             return Some(EncodedBlit {
                 bytes: Vec::new(),
                 full: false,
+                changed: None,
                 next_last_visible_cursor: self.last_visible_cursor,
                 next_last_cursor_shape: self.last_cursor_shape,
                 suppress_visible_cursor,
@@ -167,7 +244,7 @@ impl BlitEncoder {
         let mut bytes = Vec::new();
         let mut next_last_visible_cursor = self.last_visible_cursor;
         let mut next_last_cursor_shape = self.last_cursor_shape;
-        blit_patch_to(
+        let changed = blit_patch_to(
             &mut bytes,
             frame,
             rows,
@@ -176,10 +253,14 @@ impl BlitEncoder {
             &mut next_last_cursor_shape,
             repeat_ime_anchor_after_sync(),
             suppress_visible_cursor,
+            track_changed,
         );
         Some(EncodedBlit {
             bytes,
             full: false,
+            changed: track_changed
+                .then_some(changed)
+                .filter(|bounds| !bounds.is_empty()),
             next_last_visible_cursor,
             next_last_cursor_shape,
             suppress_visible_cursor,
@@ -505,7 +586,7 @@ fn cells_equal(a: &CellData, b: &CellData) -> bool {
 fn blit_frame_to(writer: impl Write, frame: &FrameData, prev: Option<&FrameData>) {
     let mut last_visible_cursor = None;
     let mut last_cursor_shape = 0;
-    blit_frame_to_with_cursor_memory(
+    let _ = blit_frame_to_with_cursor_memory(
         writer,
         frame,
         prev,
@@ -523,7 +604,7 @@ fn blit_frame_to_with_cursor_memory(
     last_visible_cursor: &mut Option<(u16, u16)>,
     last_cursor_shape: &mut u8,
     suppress_visible_cursor: bool,
-) {
+) -> ChangedBounds {
     blit_frame_to_with_cursor_memory_and_policy(
         writer,
         frame,
@@ -532,7 +613,7 @@ fn blit_frame_to_with_cursor_memory(
         last_cursor_shape,
         repeat_ime_anchor_after_sync(),
         suppress_visible_cursor,
-    );
+    )
 }
 
 #[cfg(test)]
@@ -544,7 +625,7 @@ fn blit_frame_to_with_cursor_memory_and_policy(
     last_cursor_shape: &mut u8,
     repeat_ime_anchor: bool,
     suppress_visible_cursor: bool,
-) {
+) -> ChangedBounds {
     blit_frame_to_with_cursor_memory_and_clear_policy(
         writer,
         frame,
@@ -554,7 +635,8 @@ fn blit_frame_to_with_cursor_memory_and_policy(
         repeat_ime_anchor,
         true,
         suppress_visible_cursor,
-    );
+        true,
+    )
 }
 
 fn frame_cell_index(frame: &FrameData, x: u16, y: u16) -> Option<usize> {
@@ -612,11 +694,18 @@ fn blit_patch_to(
     last_cursor_shape: &mut u8,
     repeat_ime_anchor: bool,
     suppress_visible_cursor: bool,
-) {
+    track_changed: bool,
+) -> ChangedBounds {
     let _ = writer.write_all(b"\x1b[?2026h\x1b[?25l\x1b]8;;\x1b\\");
     let mut last_sgr = String::new();
     let mut last_style = None;
     let mut active_hyperlink = None;
+    let mut changed = ChangedBounds {
+        left: u16::MAX,
+        top: u16::MAX,
+        right: 0,
+        bottom: 0,
+    };
     for row in rows {
         let mut invalidated = 0usize;
         let mut to_skip = 0usize;
@@ -637,6 +726,9 @@ fn blit_patch_to(
                     &mut active_hyperlink,
                     frame,
                 );
+                if track_changed {
+                    changed = changed.extended(col, row.y, cell_width(cell) as u16);
+                }
                 next_inline_col = (cell.symbol.is_ascii() && cell_width(cell) == 1)
                     .then_some(col.saturating_add(1));
             }
@@ -668,6 +760,7 @@ fn blit_patch_to(
         write_ime_anchor_cursor_state(&mut writer, host_cursor);
     }
     let _ = writer.flush();
+    changed
 }
 
 fn blit_frame_to_with_cursor_memory_and_clear_policy(
@@ -679,7 +772,8 @@ fn blit_frame_to_with_cursor_memory_and_clear_policy(
     repeat_ime_anchor: bool,
     clear_before_full_redraw: bool,
     suppress_visible_cursor: bool,
-) {
+    track_changed: bool,
+) -> ChangedBounds {
     // On first frame or size change, do a full redraw.
     let full_redraw =
         prev.is_none() || prev.is_some_and(|p| p.width != frame.width || p.height != frame.height);
@@ -698,16 +792,22 @@ fn blit_frame_to_with_cursor_memory_and_clear_policy(
     // must not inherit it.
     let _ = writer.write_all(b"\x1b]8;;\x1b\\");
 
-    if full_redraw {
+    let changed = if full_redraw {
         if clear_before_full_redraw {
             let _ = writer.write_all(b"\x1b[2J");
         }
         write_all_cells(&mut writer, frame);
+        ChangedBounds {
+            left: 0,
+            top: 0,
+            right: frame.width,
+            bottom: frame.height,
+        }
     } else {
         // Diff-based update: only write changed cells.
         let prev = prev.unwrap();
-        write_changed_cells(&mut writer, frame, prev);
-    }
+        write_changed_cells(&mut writer, frame, prev, track_changed)
+    };
 
     // Position the cursor while it is still hidden, then restore visibility.
     // Showing before moving makes slow terminals and IMEs briefly observe the
@@ -734,6 +834,7 @@ fn blit_frame_to_with_cursor_memory_and_clear_policy(
         write_ime_anchor_cursor_state(&mut writer, host_cursor);
     }
     let _ = writer.flush();
+    changed
 }
 
 #[cfg(windows)]
@@ -1003,10 +1104,21 @@ fn cells_visually_equal(
     // Skip flag is only for ratatui internal use, not visual.
 }
 
-fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameData) {
+fn write_changed_cells(
+    writer: &mut impl Write,
+    frame: &FrameData,
+    prev: &FrameData,
+    track_changed: bool,
+) -> ChangedBounds {
     let mut last_sgr = String::new(); // Track last SGR to avoid redundant style changes.
     let mut last_style = None;
     let mut active_hyperlink = None;
+    let mut changed = ChangedBounds {
+        left: u16::MAX,
+        top: u16::MAX,
+        right: 0,
+        bottom: 0,
+    };
     let sanitized_hyperlinks = sanitized_frame_hyperlinks(frame);
     let prev_sanitized_hyperlinks = sanitized_frame_hyperlinks(prev);
 
@@ -1042,6 +1154,9 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
                     &mut active_hyperlink,
                     frame,
                 );
+                if track_changed {
+                    changed = changed.extended(col, row, cell_width(cell) as u16);
+                }
                 next_inline_col = (cell.symbol.is_ascii() && cell_width(cell) == 1)
                     .then_some(col.saturating_add(1));
             }
@@ -1058,6 +1173,7 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
     if !last_sgr.is_empty() {
         let _ = writer.write_all(b"\x1b[0m");
     }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -1675,6 +1791,67 @@ mod tests {
         assert!(
             output_str.contains('H') || output_str.contains('i'),
             "should contain cell content"
+        );
+    }
+
+    #[test]
+    fn changed_bounds_report_the_cells_a_blit_write_touched() {
+        let frame = make_frame(
+            2,
+            2,
+            vec![
+                make_cell("H", 0, 0, 0),
+                make_cell("i", 0, 0, 0),
+                make_cell("!", 0, 0, 0),
+                make_cell(" ", 0, 0, 0),
+            ],
+        );
+        let mut encoder = BlitEncoder::new();
+        let full = encoder.encode_tracking(&frame, false, true);
+        assert_eq!(
+            full.changed,
+            Some(ChangedBounds {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 2
+            }),
+            "a full redraw touches every cell"
+        );
+        assert_eq!(
+            encoder.encode(&frame, false).changed,
+            None,
+            "the untracked path reports no bounds"
+        );
+        encoder.commit(frame.clone(), full);
+
+        // Only the cell at row 1, col 0 changes.
+        let changed_frame = make_frame(
+            2,
+            2,
+            vec![
+                make_cell("H", 0, 0, 0),
+                make_cell("i", 0, 0, 0),
+                make_cell("x", 0, 0, 0),
+                make_cell(" ", 0, 0, 0),
+            ],
+        );
+        let partial = encoder.encode_tracking(&changed_frame, false, true);
+        let bounds = partial.changed.expect("a partial write reports its cells");
+        assert!(
+            bounds.touches_cells(0, 1, 1, 1),
+            "the written cell is inside the bounds"
+        );
+        assert!(
+            !bounds.touches_cells(0, 0, 2, 1),
+            "untouched rows stay outside the bounds"
+        );
+        encoder.commit(changed_frame.clone(), partial);
+
+        let identical = encoder.encode_tracking(&changed_frame, false, true);
+        assert_eq!(
+            identical.changed, None,
+            "an unchanged frame writes no cells"
         );
     }
 

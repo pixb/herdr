@@ -16,6 +16,7 @@ use crate::ghostty::{
     KittyImageDescriptor, KittyImageFormat, KittyImagePlacement, KittyPlacementRenderInfo,
 };
 use crate::layout::PaneId;
+use crate::protocol::render_ansi::ChangedBounds;
 use crate::protocol::{
     SurfaceGraphicsAsset, SurfaceGraphicsAssetKey, SurfaceGraphicsFormat, SurfaceGraphicsPlacement,
     SurfaceGraphicsScene, SurfaceGraphicsSource, SurfaceGraphicsTarget,
@@ -380,6 +381,45 @@ impl ClientState {
         }
     }
 
+    /// True when painted Sixel frames sit where host text writes can overwrite them.
+    pub(crate) fn has_painted_sixel_frames(&self) -> bool {
+        !self.sixel.painted.is_empty()
+    }
+
+    /// Re-emits painted Sixel frames whose cells a host text write touched.
+    ///
+    /// Sixel has no erase control: text written after a painted frame overwrites
+    /// its pixels in the outer terminal. Re-emitting the frame in the same frame,
+    /// after that text, restores the image without waiting for another repaint. The
+    /// painted map stays valid because the frame is still painted.
+    pub(crate) fn repaint_sixel_frames_touching(
+        &self,
+        bounds: &ChangedBounds,
+        cell_size: HostCellSize,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (key, frame) in &self.sixel.painted {
+            if !bounds.touches_cells(frame.col, frame.row, frame.cols, frame.rows) {
+                continue;
+            }
+            let Some(rgba) = self.assets.get(key) else {
+                continue;
+            };
+            bytes.extend(sixel_surface::encode_frame(
+                rgba,
+                key.image_width,
+                key.image_height,
+                cell_size.width_px.max(1),
+                cell_size.height_px.max(1),
+                frame.cols,
+                frame.rows,
+                frame.row,
+                frame.col,
+            ));
+        }
+        bytes
+    }
+
     pub(crate) fn set_scene(&mut self, mut scene: SurfaceGraphicsScene) {
         let desired = scene
             .placements
@@ -673,7 +713,17 @@ impl ClientState {
                 self.sixel_repaint_pending = true;
             }
         }
+        // The same asset can appear more than once in the visible placement list.
+        // One Sixel frame per distinct (asset, cells) covers every identical copy;
+        // emitting the same frame again would duplicate the terminal output.
+        let mut emitted: Vec<(&SurfaceGraphicsAssetKey, sixel_surface::PaintedFrame)> = Vec::new();
         for (key, frame, cell) in &targets {
+            if emitted
+                .iter()
+                .any(|(seen, seen_frame)| *seen == key && seen_frame == frame)
+            {
+                continue;
+            }
             if self.sixel.painted.get(key).copied() == Some(*frame) {
                 continue;
             }
@@ -696,6 +746,7 @@ impl ClientState {
                 self.sixel_repaint_pending |= self.sixel.painted.contains_key(key);
                 continue;
             }
+            emitted.push((key, *frame));
             ops.push(GraphicsOperation::Bytes(bytes));
         }
         self.sixel.painted = desired_map;
@@ -1336,6 +1387,101 @@ mod tests {
             "the dropped frame needs its cells written again"
         );
         assert!(!state.sixel_repaint_pending, "the request is consumed once");
+    }
+
+    #[test]
+    fn a_text_write_over_a_painted_sixel_frame_repaints_it() {
+        use super::sixel_surface::PaintedFrame;
+        use crate::kitty_graphics::{GraphicsOperation, HostCellSize};
+        use crate::protocol::render_ansi::ChangedBounds;
+        let mut state = ClientState::default();
+        state.set_scope("sixel-repaint-text");
+        let target = SurfaceGraphicsTarget::Pane {
+            pane_id: "pane".into(),
+        };
+        let image = asset(target.clone(), 1, vec![255, 0, 0, 255]);
+        let key = image.key.clone();
+        state.assets.insert(key.clone(), Arc::from(image.data));
+        let frame = PaintedFrame {
+            row: 1,
+            col: 2,
+            cols: 2,
+            rows: 2,
+        };
+        let cell_size = HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+
+        let output = state.encode_sixel_frames(vec![(key.clone(), frame, (8, 16))]);
+        assert!(
+            matches!(output.operations.as_slice(), [GraphicsOperation::Bytes(bytes)] if !bytes.is_empty()),
+            "the frame is painted once"
+        );
+
+        let outside = state.repaint_sixel_frames_touching(
+            &ChangedBounds {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 1,
+            },
+            cell_size,
+        );
+        assert!(
+            outside.is_empty(),
+            "a write outside the painted cells needs no repaint"
+        );
+
+        let bytes = state.repaint_sixel_frames_touching(
+            &ChangedBounds {
+                left: 3,
+                top: 2,
+                right: 4,
+                bottom: 3,
+            },
+            cell_size,
+        );
+        assert!(
+            !bytes.is_empty(),
+            "a write over the painted cells re-emits the frame"
+        );
+
+        let output = state.encode_sixel_frames(vec![(key.clone(), frame, (8, 16))]);
+        assert!(
+            output.operations.is_empty(),
+            "the same-frame repaint keeps the painted map valid"
+        );
+        assert_eq!(state.sixel.painted.get(&key), Some(&frame));
+    }
+
+    #[test]
+    fn identical_sixel_targets_are_painted_once() {
+        use super::sixel_surface::PaintedFrame;
+        let mut state = ClientState::default();
+        state.set_scope("sixel-dedupe");
+        let target = SurfaceGraphicsTarget::Pane {
+            pane_id: "pane".into(),
+        };
+        let image = asset(target.clone(), 1, vec![255, 0, 0, 255]);
+        let key = image.key.clone();
+        state.assets.insert(key.clone(), Arc::from(image.data));
+        let frame = PaintedFrame {
+            row: 1,
+            col: 2,
+            cols: 2,
+            rows: 2,
+        };
+
+        let output = state.encode_sixel_frames(vec![
+            (key.clone(), frame, (8, 16)),
+            (key.clone(), frame, (8, 16)),
+        ]);
+        assert_eq!(
+            output.operations.len(),
+            1,
+            "duplicate placement targets paint one Sixel frame"
+        );
     }
 
     fn asset(

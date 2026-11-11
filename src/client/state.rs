@@ -346,18 +346,34 @@ impl ClientState {
             patch.rows
         };
         let encode_started = crate::render_prof::timer();
-        let Some(encoded) =
-            self.blit_encoder
-                .encode_patch(&rows, patch.cursor.clone(), self.draw_host_cursor)
-        else {
+        let track_changed = self.sixel_paint_active();
+        let Some(encoded) = self.blit_encoder.encode_patch_tracking(
+            &rows,
+            patch.cursor.clone(),
+            self.draw_host_cursor,
+            track_changed,
+        ) else {
             crate::render_prof::event("client_surface_patch.fallback.encode");
             return Ok(false);
         };
         crate::render_prof::duration_since("client_surface_patch.encode", encode_started);
+        // A patch writes text after the painted Sixel frames it covers, so re-emit
+        // those frames right behind the patch bytes in this same write.
+        let repaint_bytes = if track_changed {
+            encoded
+                .changed
+                .map(|bounds| self.sixel_repaint_bytes(&bounds))
+                .filter(|bytes| !bytes.is_empty())
+        } else {
+            None
+        };
         let write_started = crate::render_prof::timer();
         if !encoded.bytes.is_empty() {
             let mut stdout = io::stdout();
             stdout.write_all(&encoded.bytes)?;
+            if let Some(bytes) = &repaint_bytes {
+                stdout.write_all(bytes)?;
+            }
             stdout.flush()?;
         }
         crate::render_prof::duration_since("client_surface_patch.write", write_started);
@@ -563,7 +579,7 @@ impl ClientState {
         }
         let frame_output::ComposedFrame {
             frame: mut frame_data,
-            graphics,
+            mut graphics,
         } = frame_data.into();
         // With capture enabled, host OSC 8 can intercept Ctrl-click before plugins.
         // Keep semantic links internally and restore native links when capture is off.
@@ -575,15 +591,30 @@ impl ClientState {
         } else {
             frame_data
         };
+        let track_changed = self.sixel_paint_active();
         let encoded = if self.draw_host_cursor {
             self.blit_encoder
-                .encode_with_suppressed_visible_cursor(&frame_data, self.repaint_pending)
+                .encode_with_suppressed_visible_cursor_tracking(
+                    &frame_data,
+                    self.repaint_pending,
+                    track_changed,
+                )
         } else {
-            self.blit_encoder.encode(&frame_data, self.repaint_pending)
+            self.blit_encoder
+                .encode_tracking(&frame_data, self.repaint_pending, track_changed)
         };
         // Sixel frames cannot be erased by the terminal, so dropping one asks the
         // next frame to repaint every cell over the stale pixels.
         let repaint_after_graphics = graphics.repaint_required;
+        // Text written by this frame can overwrite painted Sixel frames. Re-emit
+        // those frames after the text in the same output instead of waiting for a
+        // later compose the patch path may never run.
+        if track_changed {
+            if let Some(bounds) = encoded.changed {
+                let bytes = self.sixel_repaint_bytes(&bounds);
+                graphics.push_bytes(bytes);
+            }
+        }
         if let Err(error) = self.write_composed_output(writer, &encoded.bytes, graphics) {
             tracing::warn!(%error, "failed to present client frame");
             self.repaint_pending = true;
@@ -592,6 +623,25 @@ impl ClientState {
         self.blit_encoder.commit(frame_data, encoded);
         self.repaint_pending = repaint_after_graphics;
         true
+    }
+
+    /// True when painted Sixel frames sit where host text writes can overwrite them,
+    /// which is when blit writes must track the cells they touch.
+    fn sixel_paint_active(&self) -> bool {
+        self.kitty_graphics_enabled
+            && crate::kitty_graphics::host_graphics() == crate::kitty_graphics::HostGraphics::Sixel
+            && self
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.has_painted_graphics())
+    }
+
+    /// Sixel bytes that repaint painted frames covering cells this frame wrote.
+    fn sixel_repaint_bytes(&self, bounds: &render_ansi::ChangedBounds) -> Vec<u8> {
+        self.shell
+            .as_ref()
+            .map(|shell| shell.repaint_graphics_touching(bounds))
+            .unwrap_or_default()
     }
 }
 

@@ -1218,6 +1218,21 @@ impl ClientShellState {
         }
     }
 
+    /// True when painted Sixel frames sit where pane text writes can overwrite them.
+    pub(crate) fn has_painted_graphics(&self) -> bool {
+        self.graphics.has_painted_sixel_frames()
+    }
+
+    /// Re-emits painted Sixel frames whose cells a pane text write touched, so the
+    /// image survives text written after it.
+    pub(crate) fn repaint_graphics_touching(
+        &self,
+        bounds: &crate::protocol::render_ansi::ChangedBounds,
+    ) -> Vec<u8> {
+        self.graphics
+            .repaint_sixel_frames_touching(bounds, self.graphics_cell_size)
+    }
+
     pub(super) fn layout(&self, cols: u16, rows: u16) -> ClientShellLayout {
         self.config.layout(
             cols,
