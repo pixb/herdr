@@ -31,9 +31,25 @@ pub(crate) struct HostCellSize {
     pub height_px: u32,
 }
 
+/// The cell pitch assumed when the host terminal never reports pixel geometry.
+///
+/// Painted rasters and relayed grid math both multiply by this pitch, so a
+/// missing pitch must degrade to a readable cell, never to a 1 px cell: at 1 px
+/// per cell a 20-column frame is painted 20 px wide and disappears in the text.
+pub(crate) const DEFAULT_CELL_WIDTH_PX: u32 = 8;
+pub(crate) const DEFAULT_CELL_HEIGHT_PX: u32 = 16;
+
 impl HostCellSize {
     pub(crate) fn is_known(self) -> bool {
         self.width_px > 0 && self.height_px > 0
+    }
+
+    /// Per-axis fallback for the host pitch, keeping any axis the host reported.
+    pub(crate) fn with_default_pitch(self) -> Self {
+        Self {
+            width_px: self.width_px.max(DEFAULT_CELL_WIDTH_PX),
+            height_px: self.height_px.max(DEFAULT_CELL_HEIGHT_PX),
+        }
     }
 }
 
@@ -770,6 +786,46 @@ pub(crate) fn write_kitty_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_cell_size_defaults_only_the_missing_pitch_axes() {
+        assert_eq!(
+            HostCellSize::default().with_default_pitch(),
+            HostCellSize {
+                width_px: DEFAULT_CELL_WIDTH_PX,
+                height_px: DEFAULT_CELL_HEIGHT_PX,
+            },
+            "an unreported pitch sizes graphics with the default cell"
+        );
+        assert_eq!(
+            HostCellSize {
+                width_px: 0,
+                height_px: 28,
+            }
+            .with_default_pitch(),
+            HostCellSize {
+                width_px: DEFAULT_CELL_WIDTH_PX,
+                height_px: 28,
+            },
+            "a reported axis survives a missing partner axis"
+        );
+        assert_eq!(
+            HostCellSize {
+                width_px: 12,
+                height_px: 28,
+            }
+            .with_default_pitch(),
+            HostCellSize {
+                width_px: 12,
+                height_px: 28,
+            },
+            "a known pitch is left alone"
+        );
+        assert!(
+            HostCellSize::default().with_default_pitch().is_known(),
+            "the fallback pitch is usable for placement math"
+        );
+    }
 
     #[test]
     fn deferred_updates_match_inline_for_rgb_and_rgba() {

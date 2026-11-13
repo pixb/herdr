@@ -64,8 +64,17 @@ pub(crate) fn relay_sixel_frame(
         );
         return None;
     };
-    let cols = grid_cells(image.width, cell_width_px);
-    let rows = grid_cells(image.height, cell_height_px);
+    let (cols, rows) = relay_grid(image.width, image.height, cell_width_px, cell_height_px);
+    if crate::logging::graphics_diagnostics_enabled() {
+        tracing::info!(
+            payload_len = payload.len(),
+            declared_pixel_height = pixel_height,
+            decoded_width = image.width,
+            decoded_height = image.height,
+            content_rows = crate::sixel::decode::content_row_extent(&image),
+            "sixel relay decoded raster content"
+        );
+    }
     if cols == 0 || rows == 0 {
         tracing::debug!(
             image_width = image.width,
@@ -102,9 +111,54 @@ fn grid_cells(pixels: u32, cell_pixels: u32) -> u32 {
     (pixels as u64).div_ceil(cell).min(u32::MAX as u64) as u32
 }
 
+/// Grid a relayed frame occupies, sized with the default cell where the host
+/// pitch is missing. A 1 px fallback would claim one column per image pixel and
+/// place a frame wider than the pane, so the placement is dropped.
+fn relay_grid(
+    image_width: u32,
+    image_height: u32,
+    cell_width_px: u32,
+    cell_height_px: u32,
+) -> (u32, u32) {
+    (
+        grid_cells(
+            image_width,
+            cell_width_px.max(crate::kitty_graphics::DEFAULT_CELL_WIDTH_PX),
+        ),
+        grid_cells(
+            image_height,
+            cell_height_px.max(crate::kitty_graphics::DEFAULT_CELL_HEIGHT_PX),
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_grid_falls_back_to_the_default_cell_for_a_missing_pitch() {
+        assert_eq!(
+            relay_grid(16, 16, 0, 0),
+            (2, 1),
+            "an unknown pitch sizes with the default 8x16 cell"
+        );
+        assert_eq!(
+            relay_grid(16, 16, 1, 1),
+            (2, 1),
+            "a 1 px pitch is treated as missing, not as one column per pixel"
+        );
+        assert_eq!(
+            relay_grid(240, 240, 12, 28),
+            (20, 9),
+            "a reported pitch is honored"
+        );
+        assert_eq!(
+            relay_grid(240, 240, 8, 16),
+            (30, 15),
+            "the default pitch sizes a preview-sized frame for the pane grid"
+        );
+    }
 
     #[test]
     fn grid_cells_round_up_and_never_zero() {
