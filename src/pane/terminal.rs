@@ -195,6 +195,22 @@ pub(crate) struct GhosttyPaneTerminal {
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
 }
 
+/// One Sixel frame relayed into a pane's terminal core as a Kitty placement.
+///
+/// Sixel has no image identity: it paints over the cell grid at the current
+/// cursor. A frame that lands on the same origin as a relayed frame continues
+/// that frame — graphics previewers such as lf read their preview buffer
+/// incrementally and stream one frame in several chunks, so only the last chunk
+/// carries the whole raster. Keeping every relayed frame painted lets a leading
+/// chunk win, so the placement recorded here drives superseding: a new frame at
+/// the same origin replaces the frames recorded for it, frames at other origins
+/// coexist.
+pub(crate) struct RelayedSixelImage {
+    pub image_id: u32,
+    pub row: u16,
+    pub col: u16,
+}
+
 pub(crate) struct GhosttyPaneCore {
     #[cfg(test)]
     pub dirty_collection_hook: Option<Box<dyn FnOnce() + Send>>,
@@ -213,10 +229,11 @@ pub(crate) struct GhosttyPaneCore {
     /// text-caching previewer already corrupts the introducer's ESC byte, and the
     /// repair needs the whole pattern, so the fragment is joined to the next batch.
     pub introducer_repair: IntroducerRepairState,
-    /// Synthetic image IDs relayed for this pane; deleted when the child
-    /// clears the screen or toggles DECSDM (the VT core keeps Kitty
-    /// placements on ED).
-    pub sixel_image_ids: Vec<u32>,
+    /// Sixel frames relayed for this pane: synthetic image IDs with the cell
+    /// origin each placement landed on. Deleted when the child clears the screen
+    /// or toggles DECSDM (the VT core keeps Kitty placements on ED), and when a
+    /// later frame lands on the same origin.
+    pub sixel_image_ids: Vec<RelayedSixelImage>,
     pub initial_default_foreground: Option<crate::ghostty::RgbColor>,
     pub initial_default_background: Option<crate::ghostty::RgbColor>,
     pub host_terminal_theme: crate::terminal_theme::TerminalTheme,
@@ -304,6 +321,21 @@ fn has_kitty_introducer(bytes: &[u8]) -> bool {
     bytes
         .windows(3)
         .any(|window| window == b"\x1b_G" || window == b"\x1bPG")
+}
+
+/// Arrival window of the first Kitty introducer, for the arrival-shape diagnostic.
+///
+/// A batch that starts a Kitty transmission proves the pane received a live
+/// introducer, but not that its metadata survived: a text-caching previewer can
+/// keep the introducer and corrupt the metadata after it. The window and the
+/// batch head and tail identify the sender and the surviving terminator.
+fn kitty_introducer_arrival_shape(bytes: &[u8]) -> Option<(usize, String)> {
+    let offset = bytes
+        .windows(3)
+        .position(|window| window == b"\x1b_G" || window == b"\x1bPG")?;
+    let start = offset.saturating_sub(8);
+    let end = (offset + 56).min(bytes.len());
+    Some((offset, hex_bytes(&bytes[start..end])))
 }
 
 /// Lowercase hex of a short byte slice, for the arrival-shape diagnostic.
@@ -489,6 +521,22 @@ fn strip_graphics_control_sequences<'a>(
             batch_len = bytes.len(),
             "graphics transport decision"
         );
+        if let Some((offset, window)) = kitty_introducer_arrival_shape(bytes) {
+            // The introducer survived, so record the metadata right behind it and
+            // both ends of the batch: the head names the sender, the tail shows
+            // whether the string terminator survived into this batch.
+            let head = hex_bytes(&bytes[..bytes.len().min(48)]);
+            let tail = hex_bytes(&bytes[bytes.len().saturating_sub(48)..]);
+            tracing::info!(
+                offset,
+                window,
+                len = bytes.len(),
+                head,
+                tail,
+                sha256 = %crate::checksum::bytes_sha256(bytes),
+                "kitty introducer arrival shape"
+            );
+        }
     }
     if crate::logging::graphics_diagnostics_enabled() {
         if let Some(offset) =
@@ -1910,8 +1958,8 @@ impl GhosttyPaneTerminal {
         {
             let ids = core.sixel_image_ids.drain(..).collect::<Vec<_>>();
             let mut delete = Vec::new();
-            for id in ids {
-                crate::kitty_graphics::encode_delete_image(&mut delete, id);
+            for image in ids {
+                crate::kitty_graphics::encode_delete_image(&mut delete, image.image_id);
             }
             core.terminal.write(&delete);
         }
@@ -1948,8 +1996,8 @@ impl GhosttyPaneTerminal {
             {
                 let ids = core.sixel_image_ids.drain(..).collect::<Vec<_>>();
                 let mut delete = Vec::new();
-                for id in ids {
-                    crate::kitty_graphics::encode_delete_image(&mut delete, id);
+                for image in ids {
+                    crate::kitty_graphics::encode_delete_image(&mut delete, image.image_id);
                 }
                 core.terminal.write(&delete);
             }
@@ -2008,6 +2056,24 @@ impl GhosttyPaneTerminal {
                     let background = core
                         .initial_default_background
                         .map(|color| [color.r, color.g, color.b, 255]);
+                    // The placement lands on the current cursor. Sixel paints over
+                    // the cell grid, so frames a previewer streams at one origin are
+                    // chunks of a single image: drop the placements recorded for this
+                    // origin before relaying, and keep placements at other origins.
+                    let (row, col) =
+                        relayed_placement_origin(&mut core.render_state, &core.terminal);
+                    let (kept, superseded): (Vec<RelayedSixelImage>, Vec<RelayedSixelImage>) = core
+                        .sixel_image_ids
+                        .drain(..)
+                        .partition(|image| image.row != row || image.col != col);
+                    core.sixel_image_ids = kept;
+                    if !superseded.is_empty() {
+                        let mut delete = Vec::new();
+                        for image in &superseded {
+                            crate::kitty_graphics::encode_delete_image(&mut delete, image.image_id);
+                        }
+                        core.terminal.write(&delete);
+                    }
                     let image_id = crate::sixel::forward::relay_sixel_frame(
                         &mut core.terminal,
                         payload,
@@ -2017,16 +2083,24 @@ impl GhosttyPaneTerminal {
                         background,
                     );
                     if crate::logging::graphics_diagnostics_enabled() {
+                        let bands = payload.iter().filter(|byte| **byte == b'-').count();
+                        let filled_bands = payload
+                            .split(|byte: &u8| *byte == b'-')
+                            .filter(|band| band.iter().any(|byte| *byte != b'$'))
+                            .count();
                         tracing::info!(
                             payload = payload.len(),
                             relayed = image_id.is_some(),
                             pixel_height,
+                            bands,
+                            filled_bands,
                             cell = ?(core.cell_width_px, core.cell_height_px),
                             "sixel relay attempt"
                         );
                     }
                     if let Some(image_id) = image_id {
-                        core.sixel_image_ids.push(image_id);
+                        core.sixel_image_ids
+                            .push(RelayedSixelImage { image_id, row, col });
                     }
                 }
                 let peek = &bytes[seg_end..];
@@ -2112,10 +2186,20 @@ impl GhosttyPaneTerminal {
     }
 
     fn drain_pending_pty_responses(&self) -> Vec<Bytes> {
-        self.pending_pty_responses
+        let mut responses = self
+            .pending_pty_responses
             .lock()
             .map(|mut responses| std::mem::take(&mut *responses))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Pane apps gate graphics output on the primary device attributes answer.
+        advertise_sixel_in_device_attributes(
+            &mut responses,
+            matches!(
+                crate::kitty_graphics::host_graphics(),
+                crate::kitty_graphics::HostGraphics::Sixel,
+            ),
+        );
+        responses
     }
 
     pub fn seed_history_ansi(&self, ansi: &str) {
@@ -3073,6 +3157,20 @@ fn encode_key_with(
 
 /// True when the pane's app asked for no enhanced keyboard protocol (no Kitty
 /// flags, no modifyOtherKeys 2), read from libghostty's live state.
+/// Cell origin a relayed Sixel placement will land on: the pane's current cursor.
+fn relayed_placement_origin(
+    render_state: &mut crate::ghostty::RenderState,
+    terminal: &crate::ghostty::Terminal,
+) -> (u16, u16) {
+    let _ = render_state.update(terminal);
+    render_state
+        .cursor()
+        .ok()
+        .and_then(|cursor| cursor.viewport)
+        .map(|viewport| (viewport.y, viewport.x))
+        .unwrap_or((0, 0))
+}
+
 fn keyboard_negotiated_nothing(terminal: &crate::ghostty::Terminal) -> bool {
     terminal
         .kitty_keyboard_flags()
@@ -3935,6 +4033,40 @@ fn is_matching_libghostty_color_reply(response: &Bytes, event: DefaultColorEvent
         && (response.ends_with(b"\x07") || response.ends_with(b"\x1b\\"))
 }
 
+/// Advertises Sixel graphics (primary device attribute feature 4) to pane
+/// applications when Herdr can accept and relay a Sixel frame.
+///
+/// Graphics-aware pane apps gate their Sixel output on this answer: lf only
+/// forwards a previewer's raster to the terminal when the device attributes
+/// report the graphics feature. Without it the raster stays in the app's own
+/// buffer and never reaches the pane. Every feature the underlying terminal core
+/// reported is preserved, and an answer that already lists the feature is left
+/// untouched.
+fn advertise_sixel_in_device_attributes(responses: &mut [Bytes], sixel_relay_enabled: bool) {
+    if !sixel_relay_enabled {
+        return;
+    }
+    for response in responses {
+        let Some(body) = response
+            .strip_prefix(b"\x1b[?62;".as_slice())
+            .and_then(|body| body.strip_suffix(b"c".as_slice()))
+        else {
+            continue;
+        };
+        if body
+            .split(|byte| *byte == b';')
+            .any(|feature| feature == b"4")
+        {
+            continue;
+        }
+        let mut advertised = Vec::with_capacity(response.len() + 2);
+        advertised.extend_from_slice(b"\x1b[?62;4;");
+        advertised.extend_from_slice(body);
+        advertised.push(b'c');
+        *response = Bytes::from(advertised);
+    }
+}
+
 fn respond_to_default_color_event(
     core: &mut GhosttyPaneCore,
     event: DefaultColorEvent,
@@ -4383,6 +4515,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn kitty_introducer_arrival_shape_reports_the_surviving_metadata() {
+        let batch = b"text\x1b_Ga=T,f=100,i=1,p=1,q=2\x1b\\tail";
+        let (offset, window) =
+            kitty_introducer_arrival_shape(batch).expect("the introducer is located");
+        assert_eq!(offset, 4, "the introducer offset is reported");
+        assert!(
+            window.contains("1b5f47"),
+            "the window carries the introducer bytes"
+        );
+        assert!(
+            window.contains(&hex_bytes(b"a=T")),
+            "the metadata behind the introducer is visible in the window"
+        );
+        assert!(
+            kitty_introducer_arrival_shape(b"plain text batch").is_none(),
+            "a batch without a Kitty introducer reports nothing"
+        );
     }
 
     #[test]
@@ -5220,21 +5372,49 @@ mod tests {
     }
 
     #[test]
-    fn two_frames_coexist_until_cleared() {
+    fn a_relayed_frame_supersedes_the_frame_at_the_same_placement() {
         let _guard = sixel_mode_test_lock();
         crate::sixel::set_mode(None);
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, _rx) = mpsc::channel(8);
         let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
         terminal.enable_kitty_graphics().unwrap();
         let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
         let pane_id = PaneId::from_raw(1);
 
-        pane.process_pty_bytes(pane_id, 0, b"\x1bPq!20~\x1b\\", &tx);
-        pane.process_pty_bytes(pane_id, 0, b"\x1bPq!10~\x1b\\", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2;1H\x1bPq#1;100;0;0!20~\x1b\\", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2;1H\x1bPq#1;100;0;0!10~\x1b\\", &tx);
         let core = pane.core.lock().unwrap();
-        let placements = core.terminal.kitty_image_placements().unwrap();
-        assert_eq!(placements.len(), 2, "both frames remain placed");
-        assert_eq!(core.sixel_image_ids.len(), 2, "both ids tracked");
+        assert_eq!(
+            core.terminal.kitty_image_placements().unwrap().len(),
+            1,
+            "a frame at the same origin continues the frame it lands on, so the earlier placement is dropped"
+        );
+        assert_eq!(
+            core.sixel_image_ids.len(),
+            1,
+            "only the current frame is tracked"
+        );
+    }
+
+    #[test]
+    fn relayed_frames_at_different_placements_coexist_until_cleared() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~\x1b\\", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[10;1H\x1bPq#1;100;0;0!10~\x1b\\", &tx);
+        let core = pane.core.lock().unwrap();
+        assert_eq!(
+            core.terminal.kitty_image_placements().unwrap().len(),
+            2,
+            "a frame at another origin is a separate image"
+        );
+        assert_eq!(core.sixel_image_ids.len(), 2, "both origins tracked");
     }
 
     #[test]
@@ -7275,6 +7455,33 @@ mod tests {
                 Bytes::from_static(b"\x1b[6;20;10t"),
                 Bytes::from_static(b"\x1b[8;30;100t"),
             ]
+        );
+    }
+
+    #[test]
+    fn device_attributes_advertise_sixel_only_when_the_relay_can_accept_it() {
+        let mut responses = vec![
+            Bytes::from_static(b"\x1b[?62;22c"),
+            Bytes::from_static(b"\x1b[?62;1;2;4;22c"),
+            Bytes::from_static(b"\x1b[?1;2c"),
+        ];
+        advertise_sixel_in_device_attributes(&mut responses, true);
+        assert_eq!(
+            responses,
+            vec![
+                Bytes::from_static(b"\x1b[?62;4;22c"),
+                Bytes::from_static(b"\x1b[?62;1;2;4;22c"),
+                Bytes::from_static(b"\x1b[?1;2c"),
+            ],
+            "the graphics feature is added once and reported features stay in order",
+        );
+
+        let mut kitty_host = vec![Bytes::from_static(b"\x1b[?62;22c")];
+        advertise_sixel_in_device_attributes(&mut kitty_host, false);
+        assert_eq!(
+            kitty_host,
+            vec![Bytes::from_static(b"\x1b[?62;22c")],
+            "a host that cannot take relayed Sixel keeps the original answer",
         );
     }
 

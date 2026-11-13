@@ -1039,8 +1039,8 @@ impl ClientShellState {
             pending_pane_surface: None,
             graphics: crate::kitty_graphics::surface::ClientState::new(),
             graphics_cell_size: crate::kitty_graphics::HostCellSize {
-                width_px: 1,
-                height_px: 1,
+                width_px: crate::kitty_graphics::DEFAULT_CELL_WIDTH_PX,
+                height_px: crate::kitty_graphics::DEFAULT_CELL_HEIGHT_PX,
             },
             popup_terminal_id: None,
             sidebar_collapsed,

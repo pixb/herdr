@@ -51,9 +51,10 @@ impl ClientShellState {
 
     pub(crate) fn set_graphics_cell_size(&mut self, width_px: u32, height_px: u32) {
         self.graphics_cell_size = crate::kitty_graphics::HostCellSize {
-            width_px: width_px.max(1),
-            height_px: height_px.max(1),
-        };
+            width_px,
+            height_px,
+        }
+        .with_default_pitch();
     }
 
     pub(super) fn compose_graphics(
