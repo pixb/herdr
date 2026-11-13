@@ -50,6 +50,28 @@ impl fmt::Display for DecodeError {
     }
 }
 
+/// Rows of the decoded raster that carry any painted pixel.
+///
+/// A relayed frame whose payload stops early decodes into a raster that is
+/// transparent below the leading bands, and painting it shows only a strip at
+/// the top of its placement. Diagnostics compare this against the declared
+/// height to tell a short payload from a decoder that lost the tail.
+pub(crate) fn content_row_extent(image: &DecodedImage) -> u32 {
+    let width = image.width.max(1) as usize;
+    let mut extent = 0u32;
+    for row in 0..image.height {
+        let base = row as usize * width * 4;
+        let painted = image
+            .rgba
+            .get(base..base + width * 4)
+            .is_some_and(|pixels| pixels.chunks(4).any(|pixel| pixel[3] != 0));
+        if painted {
+            extent = row + 1;
+        }
+    }
+    extent
+}
+
 /// Decode a Sixel payload into RGBA pixels.
 ///
 /// `pixel_height` is the frame height in pixels derived from the band count
@@ -176,18 +198,17 @@ pub(crate) fn decode_sixel(
             0x1b => {
                 // `ESC P` opens the DCS frame and `ESC \` closes it. The
                 // payload may embed framing when callers pass full frames,
-                // so skip the introducer and stop at the terminator.
+                // so skip the introducer and stop at the terminator. A lone
+                // `\` is band data (bit pattern 0x1d), never a terminator.
                 if payload.get(i + 1) == Some(&b'P') {
                     drawing = false;
                     x = 0;
                     i = i.saturating_add(2);
+                } else if payload.get(i + 1) == Some(&b'\\') {
+                    i = payload.len();
                 } else {
                     i = i.saturating_add(1);
                 }
-            }
-            b'\\' => {
-                // String terminator: band data ends here.
-                i = payload.len();
             }
             0x3f..=0x7e => {
                 drawing = true;
@@ -226,7 +247,22 @@ pub(crate) fn decode_sixel(
 /// Width follows libsixel's `max_x`: only columns that actually paint a
 /// pixel count. A trailing `?` (all six rows clear) advances the pen but
 /// must not widen the image.
+/// The DCS `Pbgmode` parameter (`ESC P Pmacro;Pbgmode;…q`) when the payload carries
+/// its header. `Pbgmode == 1` is the transparent-background request.
+fn dcs_pbgmode(payload: &[u8]) -> Option<u8> {
+    let start = payload.windows(2).position(|pair| pair == b"\x1bP")?;
+    let preamble = payload[start + 2..].iter().position(|byte| *byte == b'q')?;
+    payload[start + 2..start + 2 + preamble]
+        .split(|byte: &u8| *byte == b';')
+        .nth(1)
+        .and_then(|field| std::str::from_utf8(field).ok()?.parse().ok())
+}
+
 pub(crate) fn scan_pass(payload: &[u8]) -> (usize, bool, bool) {
+    // Transparency comes from the frame's own Pbgmode. Payloads handed over without
+    // their header keep the older DECGRA convention, where Herdr's encoder marked a
+    // transparent frame by the raster attribute that carries no drawing offset.
+    let pbgmode = dcs_pbgmode(payload);
     let mut width = 0usize;
     let mut x = 0usize;
     let mut max_drawn_x = 0usize;
@@ -266,17 +302,16 @@ pub(crate) fn scan_pass(payload: &[u8]) -> (usize, bool, bool) {
             }
             0x1b => {
                 // Frame introducer `ESC P` (skip) and `ESC \` (stop): framing
-                // bytes are not band data, so they must not move the pen.
+                // bytes are not band data, so they must not move the pen. A lone
+                // `\` is band data, never a terminator.
                 if payload.get(i + 1) == Some(&b'P') {
                     x = 0;
                     i = i.saturating_add(2);
+                } else if payload.get(i + 1) == Some(&b'\\') {
+                    i = payload.len();
                 } else {
                     i = i.saturating_add(1);
                 }
-            }
-            b'\\' => {
-                // String terminator: the frame ends, stop scanning.
-                i = payload.len();
             }
             b'#' => {
                 // Color set command `#…`: parameter digits must not advance
@@ -315,9 +350,10 @@ pub(crate) fn scan_pass(payload: &[u8]) -> (usize, bool, bool) {
             }
             b'"' => {
                 let (attrs, next) = raster_attrs(payload, i + 1);
-                if attrs.len() >= 2 && attrs[1] == 1 {
-                    transparent_bg = true;
-                }
+                transparent_bg = match pbgmode {
+                    Some(mode) => mode == 1,
+                    None => attrs.len() >= 2 && attrs[1] == 1,
+                };
                 // Newline: the next band line starts at column 0.
                 x = 0;
                 i = next;
@@ -595,6 +631,45 @@ const CUBE: [u8; 6] = [0, 51, 102, 153, 204, 255];
 mod tests {
     use super::*;
 
+    #[test]
+    fn backslash_is_band_data_and_only_the_string_terminator_ends_the_frame() {
+        // 0x5c is a legal band character (bit pattern 0x1d). Reading a lone `\` as
+        // the string terminator stops decoding at the first band that contains one,
+        // so a full frame paints only its top strip.
+        let payload = b"#1;2;40;40;40~\\-#1;2;40;40;40~\x1b\\#1;2;40;40;40~";
+        let image = decode_sixel(payload, 18, Some([0, 0, 0, 255])).expect("frame decodes");
+        let width = image.width as usize;
+        // Band 1 follows the backslash and must paint; band 2 sits after the
+        // `ESC \` terminator and must stay the background fill. RGB components are
+        // 0–100 in Sixel, so 40 decodes to 102.
+        assert_eq!(
+            px(&image.rgba, width, 0, 10),
+            [102, 102, 102, 255],
+            "the band after a backslash paints"
+        );
+        assert_eq!(
+            px(&image.rgba, width, 0, 14),
+            [0, 0, 0, 255],
+            "the band after the string terminator does not paint"
+        );
+    }
+
+    #[test]
+    fn transparency_follows_the_dcs_pbgmode_and_decgra_is_only_a_fallback() {
+        let with_header = b"\x1bP0;0;0;0;1;1;0;0;0;0;0;0q\"1;1;10;6#1;2;100;0;0~\x1b\\";
+        let (_, transparent, _) = scan_pass(with_header);
+        assert!(
+            !transparent,
+            "Pbgmode 0 asks for the terminal background, whatever DECGRA says"
+        );
+        let headerless = b"\"1;1;10;6#1;2;100;0;0~";
+        let (_, transparent, _) = scan_pass(headerless);
+        assert!(
+            transparent,
+            "a payload handed over without its header keeps the DECGRA convention"
+        );
+    }
+
     fn px(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
         let offset = (y * width + x) * 4;
         rgba[offset..offset + 4].try_into().unwrap()
@@ -781,8 +856,8 @@ mod tests {
             .position(|byte| *byte == b'q')
             .expect("preamble terminator");
         let st = stream[q..]
-            .iter()
-            .position(|byte| *byte == b'\\')
+            .windows(2)
+            .position(|pair| pair == b"\x1b\\")
             .expect("string terminator");
         let payload = &stream[q + 1..q + 1 + st];
         // Production computes pixel height from the band count the frame scanner
@@ -842,7 +917,7 @@ mod tests {
     #[test]
     fn leading_transparent_run_is_band_data_not_a_width_parameter() {
         // Columns 2 and 6 painted, columns 0, 1, 3, 4, 5 transparent.
-        let payload = b"q\"1;1;6;7#3;2;100;0;0#0??#3~#0???#3~$-\\x1b\\";
+        let payload = b"q\"1;1;6;7#3;2;100;0;0#0??#3~#0???#3~$-\x1b\\";
         let (width, transparent, drawing) = scan_pass(payload);
         assert_eq!(width, 7, "width counts the painted columns");
         assert!(transparent, "transparent background");
