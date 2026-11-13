@@ -1,0 +1,69 @@
+# Maintainer: pixb <https://github.com/pixb>
+# Contributor: pixb <https://github.com/pixb>
+_pkgname=herdr
+pkgname=herdr-sixel
+pkgver=0.9.5.sixel.1
+pkgrel=1
+pkgdesc="Terminal workspace manager for AI coding agents (herdr fork that relays Sixel pane graphics)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/pixb/herdr"
+license=('Apache-2.0')
+depends=('glibc' 'curl')
+makedepends=('rust' 'cargo' 'git' 'pkg-config')
+provides=('herdr')
+conflicts=('herdr')
+optdepends=(
+  'chafa: encodes images as Sixel for preview scripts such as lf scope'
+  'lf: file manager whose preview images this fork renders'
+)
+_zip_x86_64='70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'
+_zip_aarch64='ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17'
+source=(
+  "git+${url}.git#tag=${pkgver}"
+  "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+  "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz"
+)
+sha256sums=(
+  'SKIP'
+  "${_zip_x86_64}"
+  "${_zip_aarch64}"
+)
+
+# The vendored libghostty-vt builds with Zig 0.16.0. Arch currently ships a
+# newer Zig that the vendored build rejects, so the package pins the official
+# 0.16.0 tarball and points the build script at it through $ZIG.
+_zig_dir() {
+  case "$(uname -m)" in
+    x86_64) printf '%s\n' "zig-x86_64-linux-0.16.0" ;;
+    aarch64) printf '%s\n' "zig-aarch64-linux-0.16.0" ;;
+  esac
+}
+
+build() {
+  cd "${srcdir}/${_pkgname}"
+  export ZIG="${srcdir}/$(_zig_dir)/zig"
+  export LIBGHOSTTY_VT_OPTIMIZE=ReleaseFast
+  export CARGO_HOME="${srcdir}/cargo-home"
+  cargo build --release --locked --verbose
+}
+
+check() {
+  cd "${srcdir}/${_pkgname}"
+  export ZIG="${srcdir}/$(_zig_dir)/zig"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  # The repository's own task runner drives nextest; cargo test covers the same
+  # suite on a packaging host that has no cargo-nextest installed.
+  if cargo nextest --version >/dev/null 2>&1; then
+    cargo nextest run --release
+  else
+    cargo test --release --locked
+  fi
+}
+
+package() {
+  cd "${srcdir}/${_pkgname}"
+  install -Dm755 "target/release/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 CHANGES "${pkgdir}/usr/share/doc/${pkgname}/CHANGES"
+  install -Dm644 THIRD-PARTY-NOTICES.md "${pkgdir}/usr/share/doc/${pkgname}/THIRD-PARTY-NOTICES.md"
+}

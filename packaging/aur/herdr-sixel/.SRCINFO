@@ -1,0 +1,26 @@
+pkgbase = herdr-sixel
+	pkgdesc = Terminal workspace manager for AI coding agents (herdr fork that relays Sixel pane graphics)
+	pkgver = 0.9.5.sixel.1
+	pkgrel = 1
+	url = https://github.com/pixb/herdr
+	arch = x86_64
+	arch = aarch64
+	license = Apache-2.0
+	makedepends = rust
+	makedepends = cargo
+	makedepends = git
+	makedepends = pkg-config
+	depends = glibc
+	depends = curl
+	optdepends = chafa: encodes images as Sixel for preview scripts such as lf scope
+	optdepends = lf: file manager whose preview images this fork renders
+	provides = herdr
+	conflicts = herdr
+	source = git+https://github.com/pixb/herdr.git#tag=0.9.5.sixel.1
+	source = https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+	source = https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz
+	sha256sums = SKIP
+	sha256sums = 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+	sha256sums = ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+
+pkgname = herdr-sixel

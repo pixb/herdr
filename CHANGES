@@ -1,0 +1,77 @@
+# Modifications in this fork
+
+This repository is a fork of [herdrdev/herdr](https://github.com/herdrdev/herdr),
+the terminal workspace manager for coding agents. Upstream code remains
+copyright its respective authors and is licensed under the Apache License,
+Version 2.0. The full license text is in `LICENSE`; do not remove it from a
+distribution of this tree.
+
+Per section 4(b) of the Apache License 2.0, this file is the prominent notice
+that the files listed below were modified, and it records what was modified.
+Per section 4(c), the upstream copyright, license, and attribution notices are
+retained unmodified. Per section 6, this fork grants no rights in the upstream
+names, trademarks, or service names, and it is not an official Herdr release.
+
+Modifications (c) 2026-11-14 pixb, licensed under the Apache License 2.0.
+
+## Summary of the changes
+
+The fork adds Sixel as a second pane graphics transport so that pane programs
+which emit Sixel (file-manager previewers such as `lf` with a `chafa` preview
+script, `img2sixel`, OpenTUI-backed agents) render on Sixel-only outer
+terminals such as `foot`.
+
+The changes are:
+
+1. Sixel decode from pane output, including band parameters, private-set
+   parameters, DECGRA/DECSDM handling, and string terminators (`ESC \` and ST),
+   without treating a lone `~` as a terminator.
+2. Sixel encoding for the outer terminal: per-frame palette over the 216
+   register budget, full-width band lines, DECGRA PAD offsets, and uniform
+   scaling that preserves the source aspect ratio.
+3. Relay sizing from the cell pitch the host terminal reports, bounded by a
+   target pixel budget and a payload ceiling. A cell pitch reported as zero is
+   treated as unknown and never fabricated toward the pane program.
+4. Placement: relayed frames paint on the cells that the placement names, and
+   are re-emitted behind pane text that overwrites their cells.
+5. Pane capability advertisement: the pane answers Device Attributes with the
+   Sixel feature, which is what makes Sixel-speaking programs emit Sixel inside
+   a pane instead of falling back to protocols the outer terminal cannot show.
+6. Pacman/AUR installs are recognised as package-manager-managed installs, so
+   `herdr update` refuses to overwrite a packaged build with an upstream binary
+   and prints the package-manager update instruction instead.
+
+## Files modified in this fork
+
+```
+3089c346 feat: add sixel graphics protocol support
+db2d2272 feat: paint host pane graphics as sixel
+ab83a868 fix: declare sixel geometry and keep the pen moving across band gaps
+8736f45a fix: size sixel frames with the host cell pixel geometry
+26a11f36 fix: keep kitty introducers intact for the sixel transport
+b216c349 fix: declare sixel raster extent and pitch the way terminals parse them
+1ac0e104 fix: treat a sixel ? as a width parameter only before a digit
+0bc0e5c5 fix: repair graphics introducers broken by text-caching previewers
+57b0e270 test: pin the sixel transport to captured previewer bytes
+4cba9c62 fix: accept retained assets, the host cell pitch and previewer-sized sixel frames
+0625caba chore: add env-gated graphics transport diagnostics
+3e39118c fix: anchor sixel frames at the pane cursor
+2cc88cad chore: export the complete host graphics byte stream
+c784a67a fix: re-emit relayed sixel frames behind the text that overwrites them
+d7a16c22 fix: terminate sixel frames only at the string terminator
+4e419940 fix: rebuild relayed sixel frames with a per-frame palette
+262ecf6b fix: size relayed graphics with a usable cell pitch
+5f6e3c7a fix: paint relayed sixel frames on the cells the placement names
+5b577648 feat: advertise sixel support to pane applications
+6ba26a77 docs: document the Sixel capability Herdr advertises to pane applications
+1a840db7 test: read the raw pane cursor in graphics placement tests
+```
+
+`THIRD-PARTY-NOTICES.md` lists the licenses that a distribution of this tree
+must ship alongside `LICENSE`.
+
+## AUR package
+
+`packaging/aur/herdr-sixel/PKGBUILD` builds this fork as the Arch User
+Repository package `herdr-sixel`. It pins Zig 0.16.0 because the vendored
+`libghostty-vt` does not build with the Zig that Arch currently ships.
