@@ -552,7 +552,7 @@ Changing this setting requires restarting the affected Herdr server or reattachi
 
 Sixel is the classic DEC raster format. Applications that emit Sixel directly, such as `chafa --format=sixel` and many viewer CLIs, are supported in two directions.
 
-Pane output is read by default. Herdr recognizes a complete Sixel frame in a pane's byte stream, decodes it, and shows it through the same image pipeline as Kitty graphics, so placement, clipping, popups, and cleanup behave like any other pane image. Text an application prints after an image starts on the next free line. With the default `auto`, Herdr relays Sixel only when the outer terminal reports Sixel support in its device attributes; `on` forces relaying and `off` leaves the bytes untouched.
+Pane output is read by default. Herdr recognizes a complete Sixel frame in a pane's byte stream, decodes it, and shows it through the same image pipeline as Kitty graphics, so placement, clipping, popups, and cleanup behave like any other pane image. Text an application prints after an image starts on the next free line. With the default `auto`, Herdr relays Sixel only when the outer terminal reports Sixel support in its device attributes; `on` forces relaying and `off` leaves the bytes untouched. When relaying is possible, a pane's own device-attributes reply advertises the Sixel feature, so applications that probe terminal capabilities before drawing, such as image previewers, pick a Sixel palette inside a pane instead of falling back to text.
 
 ```toml
 [terminal]
@@ -566,7 +566,7 @@ sixel = "auto"
 host_graphics = "sixel"
 ```
 
-Sixel has no image-delete sequence. Herdr keeps the outer terminal's Sixel Display Mode (DECSDM) reset, so the terminal anchors each frame at the cursor cell Herdr positions it to; enabling DECSDM makes some terminals, such as Foot, ignore the cursor and pin frames to the screen origin. A frame that fits inside its pane does not scroll the screen, and when a frame disappears Herdr asks the client for a full repaint, which writes those cells again. Every frame declares its raster extent width-first with DECGRA and defines its colors with explicit RGB, so the outer terminal's Sixel palette and extent order are never assumed. `kitty` remains the default transport and is unchanged.
+Sixel has no image-delete sequence. Herdr keeps the outer terminal's Sixel Display Mode (DECSDM) reset, so the terminal anchors each frame at the cursor cell Herdr positions it to; enabling DECSDM makes some terminals, such as Foot, ignore the cursor and pin frames to the screen origin. A frame that fits inside its pane does not scroll the screen, and when a frame disappears Herdr asks the client for a full repaint, which writes those cells again. Every frame declares its raster extent width-first with DECGRA and defines its colors with explicit RGB, so the outer terminal's Sixel palette and extent order are never assumed. Colors come from a palette built per frame from the decoded image, within the 256-register Sixel budget, and every band line covers the full declared raster width, so a terminal that does not reset the pen between band lines still paints the frame level. `kitty` remains the default transport and is unchanged.
 
 Both settings need a server restart or a client reattach. In remote sessions the server's `sixel` setting controls pane parsing, while the local client's settings control output to the outer terminal.
 
