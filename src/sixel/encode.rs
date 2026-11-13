@@ -6,17 +6,22 @@
 //! * the P1 header uses the 12-parameter DEC layout terminals parse, with the
 //!   grid, the aspect ratio overrides and the graphic rectangle left neutral,
 //!   and a transparent background,
-//! * the raster attributes declare the frame size with DECGRA (`"1;1;W;H`),
+//! * the raster attributes declare the frame size with DECGRA (`"0;0;W;H`),
 //! * every colour the frame paints is defined with explicit percent RGB
 //!   (`#Pc;2;R;G;B`) before it is selected, because a terminal's Sixel palette
 //!   is not guaranteed to contain the DEC 6x6x6 cube: Foot preloads only the
 //!   16 theme colours, and xterm wraps register numbers by its register count,
+//! * the palette is built per frame from a 16-levels-per-channel histogram and
+//!   each register is defined by the average colour of the pixels that use it,
+//!   so a frame keeps the colours it actually has at the register budget
+//!   instead of collapsing onto the DEC cube's 6 levels per channel,
 //! * Raster Graphics uses ASCII band characters `? ! " # $ % &`, and RLE encodes
 //!   runs as `char` for runs of 1-3 and `!` `run` `char` for runs of 4+,
-//! * a band line never contains a space: foot and xterm ignore one without
-//!   moving the graphics pen, which folds the columns after a gap onto the
-//!   columns before it, so gaps are painted with the background register the
-//!   P1 header declares transparent,
+//! * a band line never contains a space and never drops its tail: foot and xterm
+//!   ignore one without moving the graphics pen, which folds the columns after a
+//!   gap onto the columns before it, and a line that ends early leaves the pen
+//!   short of the raster width, so unpainted columns are painted with the
+//!   background register the P1 header declares transparent,
 //! * the frame closes with the DCS string terminator. Sixel has no image-delete
 //!   sequence, so no erasure is emitted; the caller repaints the covered cells.
 //!
@@ -28,8 +33,134 @@ use std::collections::BTreeMap;
 pub const BAND_PIXELS: usize = 6;
 pub const MAX_REGISTERS: usize = 216;
 pub const TRANSPARENT_INDEX: usize = usize::MAX;
+/// Alpha below this paints as the transparent background, not as a colour.
+const TRANSPARENT_ALPHA: u8 = 128;
+/// Histogram levels per channel when a frame's palette is built.
+const BUCKET_LEVELS: usize = 16;
+const BUCKET_SHIFT: u8 = 4;
+const BUCKET_COUNT: usize = BUCKET_LEVELS * BUCKET_LEVELS * BUCKET_LEVELS;
+
+/// The colour bucket a pixel belongs to while a frame's palette is built.
+fn bucket_of(r: u8, g: u8, b: u8) -> usize {
+    ((usize::from(r) >> BUCKET_SHIFT) << 8)
+        | ((usize::from(g) >> BUCKET_SHIFT) << 4)
+        | (usize::from(b) >> BUCKET_SHIFT)
+}
+
+/// The colours one frame paints, as the registers it defines.
+///
+/// Building the palette is a histogram pass plus a mapping pass, so its cost
+/// scales with pixels and with the register budget, not with the image's colour
+/// count.
+pub struct Palette {
+    /// The RGB each register is defined with, at index `register - 1`.
+    rgb: Vec<[u8; 3]>,
+    /// Bucket index -> register index, so the same frame always selects the
+    /// same registers and a repaint reuses the same definitions.
+    buckets: Vec<usize>,
+}
+
+impl Palette {
+    /// The register a pixel paints with, `None` when it is transparent.
+    fn register(&self, r: u8, g: u8, b: u8, a: u8) -> Option<usize> {
+        if a < TRANSPARENT_ALPHA {
+            None
+        } else {
+            Some(self.buckets[bucket_of(r, g, b)] + 1)
+        }
+    }
+
+    /// The RGB a register was defined with, for tests and round-tripping.
+    fn rgb(&self, register: usize) -> [u8; 3] {
+        self.rgb
+            .get(register.saturating_sub(1))
+            .copied()
+            .unwrap_or([0, 0, 0])
+    }
+
+    #[cfg(test)]
+    fn register_count(&self) -> usize {
+        self.rgb.len()
+    }
+}
+
+fn bucket_average(sum: &[u64; 3], count: u64) -> [u8; 3] {
+    let count = count.max(1);
+    [
+        (sum[0] / count).min(255) as u8,
+        (sum[1] / count).min(255) as u8,
+        (sum[2] / count).min(255) as u8,
+    ]
+}
+
+/// The kept register whose colour is nearest to a bucket that got no register.
+fn nearest_register(rgb: &[[u8; 3]], average: &[u8; 3]) -> usize {
+    let target = [
+        i64::from(average[0]),
+        i64::from(average[1]),
+        i64::from(average[2]),
+    ];
+    rgb.iter()
+        .enumerate()
+        .min_by_key(|(_, color)| {
+            let dr = i64::from(color[0]) - target[0];
+            let dg = i64::from(color[1]) - target[1];
+            let db = i64::from(color[2]) - target[2];
+            dr * dr + dg * dg + db * db
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+/// Build the palette for `width * height` RGBA pixels.
+///
+/// Colours are bucketed at 16 levels per channel. The buckets that carry the
+/// most pixels get a register, numbered in bucket order up to `MAX_REGISTERS`;
+/// a bucket that misses the budget paints with its nearest kept colour, because
+/// the limit is the terminal's register count, not the image's colour count.
+fn build_palette(rgba: &[u8], width: usize, height: usize) -> Palette {
+    let mut counts = [0u64; BUCKET_COUNT];
+    let mut sums = [[0u64; 3]; BUCKET_COUNT];
+    for pixel in rgba.chunks_exact(4).take(width * height) {
+        if pixel[3] < TRANSPARENT_ALPHA {
+            continue;
+        }
+        let bucket = bucket_of(pixel[0], pixel[1], pixel[2]);
+        counts[bucket] += 1;
+        for channel in 0..3 {
+            sums[bucket][channel] += u64::from(pixel[channel]);
+        }
+    }
+    let mut used: Vec<usize> = (0..BUCKET_COUNT)
+        .filter(|&bucket| counts[bucket] > 0)
+        .collect();
+    // Rarest buckets compete for the last registers, so the colours covering the
+    // frame keep theirs. The bucket index breaks ties, keeping the palette
+    // stable for the same frame.
+    used.sort_by_key(|&bucket| (std::cmp::Reverse(counts[bucket]), bucket));
+    let mut kept: Vec<usize> = used.iter().copied().take(MAX_REGISTERS).collect();
+    kept.sort_unstable();
+    let rgb: Vec<[u8; 3]> = kept
+        .iter()
+        .map(|&bucket| bucket_average(&sums[bucket], counts[bucket]))
+        .collect();
+    let mut buckets = vec![0usize; BUCKET_COUNT];
+    for (index, &bucket) in kept.iter().enumerate() {
+        buckets[bucket] = index;
+    }
+    for &bucket in used.iter().skip(MAX_REGISTERS) {
+        let average = bucket_average(&sums[bucket], counts[bucket]);
+        buckets[bucket] = nearest_register(&rgb, &average);
+    }
+    Palette { rgb, buckets }
+}
 
 /// DEC 6x6x6 quantization step: 0..=5.
+///
+/// Test-only: the frame palette is built per frame, so encoding no longer maps
+/// through the cube. Kept to assert the cube stays the floor the decoder and
+/// older frames assume.
+#[cfg(test)]
 pub fn quantize(value: u8) -> usize {
     ((value as u16 + 25) / 51) as usize
 }
@@ -41,24 +172,17 @@ pub fn cube_level(level: usize) -> u8 {
     (level.min(5) * 51) as u8
 }
 
-/// One cube level in the percent scale the DEC color selector uses.
-pub fn cube_percent(level: usize) -> u8 {
-    (level.min(5) * 20) as u8
-}
-
-/// The color register a pixel maps to, `None` when it is transparent.
-///
-/// The mapping is stable: the same quantized color always selects the same
-/// register, so a repaint of the same image reuses the same definitions.
+/// The DEC cube register a pixel would map to, `None` when it is transparent.
+#[cfg(test)]
 pub fn pixel_register(r: u8, g: u8, b: u8, a: u8) -> Option<usize> {
-    if a < 128 {
+    if a < TRANSPARENT_ALPHA {
         None
     } else {
         Some(1 + quantize(r) * 36 + quantize(g) * 6 + quantize(b))
     }
 }
 
-/// The RGB a register number was defined with, for tests and round-tripping.
+/// The RGB a cube register number was defined with, for tests.
 #[cfg(test)]
 pub fn register_rgb(register: usize) -> [u8; 3] {
     let value = register.saturating_sub(1);
@@ -69,6 +193,15 @@ pub fn register_rgb(register: usize) -> [u8; 3] {
     ]
 }
 
+/// Resample RGBA to `dst_width * dst_height` with an area (box) average.
+///
+/// A relayed frame is decoded at the previewer's pixel size and painted on the
+/// host's cell grid, so the scale is almost never an integer. Nearest-neighbour
+/// sampling drops whole source rows and columns there, which shows as tearing
+/// along the six-pixel bands and shimmering detail. Averaging the source pixels
+/// each target pixel covers keeps the frame smooth, matching what a previewer's
+/// own encoder does when it writes straight to the terminal. Colors are averaged
+/// premultiplied by alpha so a transparent edge does not darken its neighbours.
 pub fn scale_rgba(
     src: &[u8],
     src_width: usize,
@@ -79,24 +212,54 @@ pub fn scale_rgba(
     if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
         return Vec::new();
     }
+    let end_column = |x: usize| ((x + 1) * src_width).div_ceil(dst_width);
+    let end_row = |y: usize| ((y + 1) * src_height).div_ceil(dst_height);
     let mut out = Vec::with_capacity(dst_width * dst_height * 4);
     for y in 0..dst_height {
-        let sy = (y * src_height) / dst_height;
+        let sy0 = (y * src_height) / dst_height;
+        let sy1 = end_row(y).clamp(sy0 + 1, src_height);
         for x in 0..dst_width {
-            let sx = (x * src_width) / dst_width;
-            let offset = (sy * src_width + sx) * 4;
-            if offset + 4 <= src.len() {
-                out.extend_from_slice(&src[offset..offset + 4]);
+            let sx0 = (x * src_width) / dst_width;
+            let sx1 = end_column(x).clamp(sx0 + 1, src_width);
+            let mut premultiplied = [0u64; 3];
+            let mut alpha = 0u64;
+            let mut covered = 0u64;
+            for row in sy0..sy1 {
+                for column in sx0..sx1 {
+                    let offset = (row * src_width + column) * 4;
+                    let Some(pixel) = src.get(offset..offset + 4) else {
+                        continue;
+                    };
+                    let a = u64::from(pixel[3]);
+                    for channel in 0..3 {
+                        premultiplied[channel] += u64::from(pixel[channel]) * a;
+                    }
+                    alpha += a;
+                    covered += 1;
+                }
             }
+            let a = (alpha / covered.max(1)) as u8;
+            if a == 0 {
+                out.extend([0, 0, 0, 0]);
+                continue;
+            }
+            let alpha_u64 = u64::from(a);
+            let channels = premultiplied.map(|sum| {
+                (sum / covered.max(1) / alpha_u64.max(1))
+                    .min(255)
+                    .try_into()
+                    .unwrap_or(255u8)
+            });
+            out.extend([channels[0], channels[1], channels[2], a]);
         }
     }
     out
 }
 
-fn indexed_image(rgba: &[u8], width: usize, height: usize) -> Vec<usize> {
+fn indexed_image(rgba: &[u8], width: usize, height: usize, palette: &Palette) -> Vec<usize> {
     let mut indexed = vec![TRANSPARENT_INDEX; width * height];
     for (i, pixel) in rgba.chunks_exact(4).enumerate().take(width * height) {
-        if let Some(idx) = pixel_register(pixel[0], pixel[1], pixel[2], pixel[3]) {
+        if let Some(idx) = palette.register(pixel[0], pixel[1], pixel[2], pixel[3]) {
             indexed[i] = idx;
         }
     }
@@ -150,22 +313,25 @@ fn push_rle(out: &mut Vec<u8>, run: usize, ch: u8) {
 /// identical masks collapse to `!` `count` `char`, and the line selects the
 /// registers it paints.
 ///
-/// Columns the colour does not paint are filled with the background register,
-/// which the frame declares transparent in the P1 header. They are never left
-/// as spaces: foot's and xterm's decoders ignore a space without moving the
-/// graphics pen, so a space gap folds the columns after it back onto the
-/// columns before it. Trailing gaps are dropped, keeping the frame compact.
+/// The line covers the **whole declared width**. Columns the colour does not
+/// paint are painted with the background register, which the P1 header declares
+/// transparent: they are never left as spaces, because foot's and xterm's
+/// decoders ignore a space without moving the graphics pen and fold the columns
+/// after a gap onto the columns before it, and a tail is never dropped, because
+/// a terminal that does not return the pen to the left margin at a band
+/// boundary starts the next band where this line stopped and the frame shears
+/// band by band.
 pub fn color_band_line(register: usize, mask: &[u8], width: usize) -> Vec<u8> {
-    let Some(last) = mask[..width].iter().rposition(|m| *m != 0) else {
+    if mask[..width].iter().all(|mask_byte| *mask_byte == 0) {
         return Vec::new();
-    };
+    }
     let mut out = Vec::new();
     let mut selected: Option<usize> = None;
     let mut i = 0;
-    while i <= last {
+    while i < width {
         let mask_byte = mask[i];
         let mut run = 1;
-        while i + run <= last && mask[i + run] == mask_byte {
+        while i + run < width && mask[i + run] == mask_byte {
             run += 1;
         }
         let target = if mask_byte == 0 { 0 } else { register };
@@ -193,21 +359,27 @@ pub fn used_registers(indexed: &[usize]) -> Vec<usize> {
 }
 
 /// Define every register the body paints with explicit percent RGB. Terminals
-/// that do not preload the DEC cube palette render the frame correctly only
-/// because of this block.
-pub fn color_definitions(used: &[usize]) -> Vec<u8> {
+/// that do not preload a palette render the frame correctly only because of
+/// this block. Percent is the whole-number scale chafa and libsixel write, so
+/// any terminal that accepts a relayed frame accepts these definitions too.
+pub fn color_definitions(used: &[usize], palette: &Palette) -> Vec<u8> {
     let mut out = Vec::new();
     for &register in used.iter().filter(|&&register| register <= MAX_REGISTERS) {
-        let value = register.saturating_sub(1);
-        let (qr, qg, qb) = (value / 36, (value / 6) % 6, value % 6);
+        let [r, g, b] = palette.rgb(register);
         out.push(b'#');
         out.extend(register.to_string().into_bytes());
         out.extend(b";2;");
-        out.extend(cube_percent(qr).to_string().into_bytes());
-        out.push(b';');
-        out.extend(cube_percent(qg).to_string().into_bytes());
-        out.push(b';');
-        out.extend(cube_percent(qb).to_string().into_bytes());
+        for value in [r, g, b] {
+            // Whole-number percent: 8-bit intensities survive to within one
+            // level and stay in the integer form every target parses.
+            out.extend(
+                ((u32::from(value) * 100 + 127) / 255)
+                    .to_string()
+                    .into_bytes(),
+            );
+            out.push(b';');
+        }
+        out.truncate(out.len() - 1);
     }
     out
 }
@@ -255,9 +427,11 @@ fn frame_header() -> Vec<u8> {
 /// xterm and libsixel all parse (`pan;pad;pixel horizontal extent;pixel vertical
 /// extent`). Declaring them the other way round makes the terminal preallocate a
 /// transposed raster buffer, so a frame wider than it is tall is clipped to a
-/// thin strip. `PAD == 1` keeps foot on its 1:1 put handler.
+/// thin strip. `PAN` and `PAD` are offsets from the graphics position: Foot moves
+/// a nonzero `PAD` down by a whole text row, so the frame is declared at the
+/// position it is written at. `PAD == 0` keeps the 1:1 put handler on Foot 1.28.
 fn raster_attributes(width: usize, height: usize) -> Vec<u8> {
-    format!("\"1;1;{width};{height}").into_bytes()
+    format!("\"0;0;{width};{height}").into_bytes()
 }
 
 /// Encodes `src` scaled to `dst_width` by `dst_height` as one self-contained
@@ -275,14 +449,15 @@ pub fn encode_frame(
     if scaled.is_empty() {
         return Vec::new();
     }
-    let indexed = indexed_image(&scaled, dst_width, dst_height);
+    let palette = build_palette(&scaled, dst_width, dst_height);
+    let indexed = indexed_image(&scaled, dst_width, dst_height, &palette);
     let body = encode_body(&indexed, dst_width, dst_height);
     if body.is_empty() {
         return Vec::new();
     }
     let mut out = frame_header();
     out.extend(raster_attributes(dst_width, dst_height));
-    out.extend(color_definitions(&used_registers(&indexed)));
+    out.extend(color_definitions(&used_registers(&indexed), &palette));
     out.extend(body);
     out.extend(b"\x1b\\");
     out
@@ -433,17 +608,19 @@ mod tests {
 
         let body = String::from_utf8_lossy(&payload);
         assert!(
-            body.contains("\"1;1;12;12"),
-            "DECGRA declares square pixels and the 12x12 extent: {body}"
+            body.contains("\"0;0;12;12"),
+            "DECGRA declares square pixels and the 12x12 extent at the graphics position: {body}"
         );
-        let registers = used_registers(&indexed_image(&scale_rgba(&rgba, 12, 12, 12, 12), 12, 12));
+        let scaled = scale_rgba(&rgba, 12, 12, 12, 12);
+        let palette = build_palette(&scaled, 12, 12);
+        let registers = used_registers(&indexed_image(&scaled, 12, 12, &palette));
         for &register in &registers {
-            let [r, g, b] = register_rgb(register);
+            let [r, g, b] = palette.rgb(register);
             let definition = format!(
                 "#{register};2;{};{};{}",
-                r as usize * 100 / 255,
-                g as usize * 100 / 255,
-                b as usize * 100 / 255
+                (u32::from(r) * 100 + 127) / 255,
+                (u32::from(g) * 100 + 127) / 255,
+                (u32::from(b) * 100 + 127) / 255
             );
             assert_eq!(
                 body.matches(&definition).count(),
@@ -455,6 +632,121 @@ mod tests {
         assert!(
             selects >= body.matches('$').count(),
             "every painted line selects the register it paints: {body}"
+        );
+    }
+
+    #[test]
+    fn a_frame_keeps_the_colours_the_dec_cube_would_merge() {
+        // Two greys inside one DEC cube level. Cube registers map both to the
+        // same colour, so an edge between them disappears; a frame palette owns
+        // a register per bucket and keeps the edge.
+        let mut rgba = Vec::new();
+        for _ in 0..6usize {
+            for x in 0..16usize {
+                let v = if x < 8 { 30u8 } else { 45u8 };
+                rgba.extend([v, v, v, 255]);
+            }
+        }
+        let merged = [
+            register_rgb(pixel_register(30, 30, 30, 255).unwrap()),
+            register_rgb(pixel_register(45, 45, 45, 255).unwrap()),
+        ];
+        assert_eq!(
+            merged[0], merged[1],
+            "the compatibility cube merges both greys"
+        );
+        let decoded = decode_sixel(&encode_frame(&rgba, 16, 6, 16, 6), 6, None).expect("frame");
+        let mut colors: Vec<[u8; 3]> = decoded
+            .rgba
+            .chunks(4)
+            .map(|p| [p[0], p[1], p[2]])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        colors.sort();
+        assert_eq!(
+            colors,
+            [[30, 30, 30], [45, 45, 45]],
+            "both greys survive the round trip"
+        );
+    }
+
+    #[test]
+    fn the_palette_caps_at_the_register_budget_and_keeps_the_frequent_colours() {
+        let mut rgba = Vec::new();
+        for y in 0..20usize {
+            for x in 0..20usize {
+                // A colour covering 80 pixels, then one colour per pixel.
+                let (r, g, b) = if x < 4 {
+                    (10, 10, 10)
+                } else {
+                    (
+                        ((x * 13 + y * 7) % 256) as u8,
+                        ((x * 29) % 256) as u8,
+                        ((y * 37) % 256) as u8,
+                    )
+                };
+                rgba.extend([r, g, b, 255]);
+            }
+        }
+        let palette = build_palette(&rgba, 20, 20);
+        assert_eq!(
+            palette.register_count(),
+            MAX_REGISTERS,
+            "the budget is the terminal's register count, not the image's colour count"
+        );
+        assert!(
+            palette.rgb.contains(&[10, 10, 10]),
+            "the colour covering a fifth of the frame keeps a register"
+        );
+        let text = String::from_utf8(encode_frame(&rgba, 20, 20, 20, 20)).expect("utf8");
+        let definitions = text
+            .split('#')
+            .filter(|s| s.starts_with(char::is_numeric) && s.contains(";2;"))
+            .count();
+        assert_eq!(definitions, MAX_REGISTERS, "one definition per register");
+    }
+
+    #[test]
+    fn definitions_use_the_whole_number_percent_scale() {
+        let text =
+            String::from_utf8(encode_frame(&rgba_pattern(24, 12), 24, 12, 24, 12)).expect("utf8");
+        let definitions: Vec<&str> = text
+            .split('#')
+            .filter(|s| s.starts_with(char::is_numeric) && s.contains(";2;"))
+            .collect();
+        assert!(
+            definitions.len() > 1,
+            "a pattern frame defines several colors"
+        );
+        for definition in definitions {
+            let fields: Vec<&str> = definition.split(';').take(5).collect();
+            assert_eq!(fields[1], "2", "RGB color-space field: {definition}");
+            assert_eq!(
+                fields.len(),
+                5,
+                "register, color space, and three channels: {fields:?}"
+            );
+            let register: usize = fields[0].parse().expect("register number");
+            assert!(
+                (1..=MAX_REGISTERS).contains(&register),
+                "register {register} stays in 1..={MAX_REGISTERS}"
+            );
+            for field in &fields[2..5] {
+                let percent: u8 = field.parse().expect("whole number percent");
+                assert!(percent <= 100, "{definition} leaves the percent scale");
+            }
+        }
+    }
+
+    #[test]
+    fn repainting_the_same_frame_reuses_the_same_definitions() {
+        let rgba = rgba_pattern(30, 12);
+        let first = encode_frame(&rgba, 30, 12, 30, 12);
+        let second = encode_frame(&rgba, 30, 12, 30, 12);
+        assert_eq!(
+            first, second,
+            "the palette is built deterministically, so a repaint replays byte-identically"
         );
     }
 
@@ -475,8 +767,8 @@ mod tests {
         mask[2] = 0;
         assert_eq!(
             String::from_utf8(color_band_line(9, &mask, 10)).unwrap(),
-            "#9@@",
-            "runs below four repeat the band character and trailing gaps are dropped"
+            "#9@@#0!8?",
+            "runs below four repeat the band character and the tail is painted with the transparent background register so the line spans the whole width"
         );
     }
 
@@ -506,7 +798,6 @@ mod tests {
         let bytes = line.as_bytes();
         let mut columns = 0usize;
         let mut i = 0usize;
-        let mut first_column = None;
         while i < bytes.len() {
             match bytes[i] {
                 b'#' => {
@@ -522,24 +813,17 @@ mod tests {
                         run = run * 10 + usize::from(bytes[i] - b'0');
                         i += 1;
                     }
-                    let painted = bytes.get(i).copied().unwrap_or(b'?') != b'?';
-                    if painted {
-                        first_column.get_or_insert(columns);
-                    }
                     columns += run;
                     i += 1;
                 }
                 b'?'..=b'~' => {
-                    if bytes[i] != b'?' {
-                        first_column.get_or_insert(columns);
-                    }
                     columns += 1;
                     i += 1;
                 }
                 _ => i += 1,
             }
         }
-        first_column.map_or(0, |first| columns - first)
+        columns
     }
 
     #[test]
@@ -548,6 +832,9 @@ mod tests {
         let payload = encode_frame(&rgba, 37, 18, 37, 18);
         let text = String::from_utf8_lossy(&payload);
         let body = &text[text.rfind('"').expect("decstra") + 1..];
+        let body = body
+            .strip_suffix("\x1b\\")
+            .expect("the frame closes with the ST");
         let mut checked = 0usize;
         for line in body.split(['-', '$']) {
             let line = line.trim_start_matches('\'');
@@ -555,9 +842,11 @@ mod tests {
                 continue;
             }
             let columns = band_line_columns(line);
-            assert!(
-                columns > 0 && columns <= 37,
-                "a band line stays inside the declared raster: {line}"
+            assert_eq!(
+                columns, 37,
+                "a band line spans the whole declared width, so a terminal that keeps the \
+                 graphics pen where a line ended still starts the next band at the left \
+                 margin: {line}"
             );
             checked += 1;
         }
@@ -605,22 +894,31 @@ mod tests {
         let payload = encode_frame(&rgba, 24, 12, 24, 12);
         let decoded = decode_sixel(&payload, 12, None).expect("decode frame");
         assert_eq!((decoded.width, decoded.height), (24, 12));
+        let mut sum = 0i64;
+        let mut worst = 0i32;
         for y in 0..12 {
             for x in 0..24 {
                 let i = (y * 24 + x) * 4;
-                let register = pixel_register(rgba[i], rgba[i + 1], rgba[i + 2], 255).unwrap();
-                let expected = register_rgb(register);
                 let got = [decoded.rgba[i], decoded.rgba[i + 1], decoded.rgba[i + 2]];
+                let expected = [rgba[i], rgba[i + 1], rgba[i + 2]];
                 for k in 0..3 {
                     let diff = i32::from(got[k]) - i32::from(expected[k]);
-                    assert!(
-                        diff.abs() <= 51,
-                        "channel {k} x={x} y={y} got {got:?} expected {expected:?}"
-                    );
+                    sum += diff.abs() as i64;
+                    worst = worst.max(diff.abs());
                 }
                 assert_eq!(decoded.rgba[i + 3], 255, "alpha x={x} y={y}");
             }
         }
+        // 288 source colours overflow the register budget, so rare buckets paint
+        // with their nearest kept colour. Measured here: mean 4.0, worst 55. The
+        // cube path was fixed at 6 levels per channel and could not keep a colour
+        // the frame actually carries.
+        let mean = sum / (24 * 12 * 3);
+        assert!(mean <= 6, "mean channel error {mean}, measured 4");
+        assert!(
+            worst <= 60,
+            "worst channel error {worst}, measured 55 on an over-budget frame"
+        );
     }
 
     #[test]
@@ -669,29 +967,45 @@ mod tests {
             (width, height)
         );
 
-        // A channel the encoder quantizes lands at `cube_percent(level) * 255 / 100`,
-        // which is exactly `level * 51`.
-        let want = |value: u8| (quantize(value) * 51) as u8;
+        // The frame paints the colours its palette defines, and the decoder
+        // reproduces them exactly. Measured spread against the source for this
+        // frame: mean 2.3, worst 7; the DEC cube path measured a worst of 27.
+        let palette = build_palette(&rgba, width, height);
+        // The definitions are written in whole percent, which is what every
+        // target terminal parses, so a register decodes to its percent-rounded
+        // colour: 200 is declared 78 and reads back 198.
+        let declared =
+            |value: u8| -> u8 { ((u32::from(value) * 100 + 127) / 255 * 255 / 100) as u8 };
+        let mut worst = 0i32;
         for y in 0..height {
             for x in 0..width {
                 let i = (y * width + x) * 4;
                 assert_eq!(
                     decoded.rgba[i + 3],
                     255,
-                    "pixel ({x},{y}) must be opaque, source rgba {src:?}",
-                    src = &rgba[i..i + 4]
+                    "pixel ({x},{y}) must be opaque, source rgba {:?}",
+                    &rgba[i..i + 4]
+                );
+                let register = palette
+                    .register(rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3])
+                    .expect("a painted pixel selects a register");
+                let [r, g, b] = palette.rgb(register).map(declared);
+                assert_eq!(
+                    [decoded.rgba[i], decoded.rgba[i + 1], decoded.rgba[i + 2]],
+                    [r, g, b],
+                    "pixel ({x},{y}) must decode to the colour its register declares"
                 );
                 for channel in 0usize..3 {
-                    assert_eq!(
-                        decoded.rgba[i + channel],
-                        want(rgba[i + channel]),
-                        "pixel ({x},{y}) channel {channel}: source {} decoded {}",
-                        rgba[i + channel],
-                        decoded.rgba[i + channel],
-                    );
+                    let diff =
+                        (i32::from(decoded.rgba[i + channel]) - i32::from(rgba[i + channel])).abs();
+                    worst = worst.max(diff);
                 }
             }
         }
+        assert!(
+            worst <= 8,
+            "the frame stays within 8 levels of the source, worst {worst}"
+        );
     }
 
     /// The same pixel-for-pixel round trip on a frame with transparent pixels:
@@ -736,10 +1050,17 @@ mod tests {
                 } else {
                     assert_eq!(decoded.rgba[i + 3], 255, "pixel ({x},{y}) must be opaque");
                     for channel in 0usize..3 {
-                        assert_eq!(
+                        // 480 painted colours against a 216 register budget: rare
+                        // buckets take their nearest kept colour. Measured worst
+                        // spread against the source is 10, the cube path was 27.
+                        let diff = (i32::from(decoded.rgba[i + channel])
+                            - i32::from(rgba[i + channel]))
+                        .abs();
+                        assert!(
+                            diff <= 12,
+                            "pixel ({x},{y}) channel {channel} round trip: source {} decoded {}",
+                            rgba[i + channel],
                             decoded.rgba[i + channel],
-                            (quantize(rgba[i + channel]) * 51) as u8,
-                            "pixel ({x},{y}) channel {channel} round trip"
                         );
                     }
                 }
@@ -773,13 +1094,10 @@ mod tests {
         let again = decode_sixel(&payload, image.height, None).expect("re-encoded frame decodes");
         assert_eq!((again.width, again.height), (image.width, image.height));
 
-        // The encoder writes colors as 6x6x6 cube percentages, so a second pass
-        // quantizes chafa's colors to the nearest cube level. Alpha is preserved
-        // exactly: transparent pixels stay transparent, painted pixels stay opaque.
-        let quantized = |v: u8| -> u8 {
-            let level = (v as u16 + 25) / 51;
-            (level * 20 * 255 / 100) as u8
-        };
+        // The palette is built from the frame's own colours, so re-encoding a
+        // previewer frame at its own size is lossless: every colour it carries
+        // already owns a register. Alpha is preserved exactly: transparent pixels
+        // stay transparent, painted pixels stay opaque.
         let painted_first = image.rgba.chunks(4).filter(|p| p[3] == 255).count();
         assert!(
             painted_first > 250,
@@ -796,17 +1114,34 @@ mod tests {
             );
             assert_eq!(
                 second,
-                [
-                    quantized(first[0]),
-                    quantized(first[1]),
-                    quantized(first[2]),
-                    first[3]
-                ],
-                "pixel ({x},{y}) must land on the 6x6x6 cube: first pass {:?} second pass {:?}",
-                first,
-                second,
+                [first[0], first[1], first[2], first[3]],
+                "a previewer frame re-encoded at its own size keeps its pixels: first pass \
+                 {first:?} second pass {second:?}",
             );
         }
+    }
+
+    #[test]
+    fn scale_averages_the_source_pixels_a_target_pixel_covers() {
+        // A relayed frame is scaled by a non-integer factor onto the host grid.
+        // Nearest-neighbour sampling copies one source pixel and drops the rest,
+        // which is what tears the frame along its six-pixel bands.
+        let src: Vec<u8> = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+        ]
+        .concat();
+        let out = scale_rgba(&src, 3, 2, 2, 1);
+        assert_eq!(out.len(), 8, "two target pixels");
+        assert_eq!(
+            &out[0..4],
+            &[127, 127, 0, 255],
+            "the source pixels one target pixel covers are averaged, not sampled"
+        );
     }
 
     #[test]
@@ -815,11 +1150,11 @@ mod tests {
         let payload = encode_frame(&rgba, 20, 6, 20, 6);
         let body = String::from_utf8_lossy(&payload);
         assert!(
-            body.contains("\"1;1;20;6"),
+            body.contains("\"0;0;20;6"),
             "a 20x6 frame declares the 20px horizontal extent then the 6px vertical extent, the order chafa, foot, xterm and libsixel parse: {body}"
         );
         assert!(
-            !body.contains("\"1;1;6;20"),
+            !body.contains("\"0;0;6;20"),
             "the extent is never declared height first, which makes the terminal preallocate a transposed raster and clip a wide frame to a strip: {body}"
         );
     }
