@@ -678,8 +678,12 @@ impl ClientState {
                 (
                     placement.asset.clone(),
                     sixel_surface::PaintedFrame {
-                        row: origin.1,
-                        col: origin.0,
+                        // The Kitty path places at the pane surface origin plus the
+                        // placement's own pane coordinates; Sixel has to land on the
+                        // same cells, or a frame a pane app positioned inside its
+                        // screen paints over the pane's top-left corner.
+                        row: origin.1.saturating_add(placement.y),
+                        col: origin.0.saturating_add(placement.x),
                         cols: placement.cols,
                         rows: placement.rows,
                     },
@@ -1342,6 +1346,32 @@ fn format_code(format: SurfaceGraphicsFormat) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sixel_targets_land_on_the_placement_cells_not_the_pane_corner() {
+        let target = SurfaceGraphicsTarget::Pane {
+            pane_id: "pane".into(),
+        };
+        let image = asset(target, 7, vec![1, 2, 3, 4]);
+        let mut placement = scene(image, 0, 0).placements[0].clone();
+        placement.x = 36;
+        placement.y = 1;
+        placement.cols = 60;
+        placement.rows = 18;
+        let cell = HostCellSize {
+            width_px: 12,
+            height_px: 28,
+        };
+        let state = ClientState::default();
+        let targets = state.sixel_targets(&[(&placement, (0, 1))], cell);
+        assert_eq!(targets.len(), 1, "the placement is paintable");
+        let frame = &targets[0].1;
+        assert_eq!(
+            (frame.row, frame.col),
+            (2, 36),
+            "the pane surface origin (col 0, row 1) plus the placement's own pane coordinates (36, 1), the cells the Kitty path uses"
+        );
+    }
 
     #[test]
     fn dropping_a_painted_sixel_frame_requests_a_full_repaint() {

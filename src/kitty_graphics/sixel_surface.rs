@@ -67,13 +67,30 @@ pub(crate) fn encode_frame(
     else {
         return Vec::new();
     };
+    // The placement rectangle is the pane's clipping of the image, and a Sixel frame
+    // paints every pixel it declares: scaling the source into the whole rectangle
+    // stretches it on one axis, which shows as a distorted image and tearing along
+    // band boundaries. Fit the source to the rectangle at one scale and paint that,
+    // leaving the rows below unpainted.
+    let fit_h = {
+        let width_px = u64::try_from(target_w).unwrap_or(u64::MAX);
+        let height_px = u64::try_from(target_h).unwrap_or(u64::MAX);
+        let fit = if image_width == 0 {
+            height_px
+        } else {
+            (u64::from(image_height) * width_px / u64::from(image_width)).max(1)
+        };
+        usize::try_from(fit.min(height_px)).unwrap_or(target_h)
+    };
+    // Foot paints a Sixel frame on the cursor's own row once DECGRA asks for no
+    // offset, so the frame is anchored at the target cell row.
     let mut out = format!("\x1b[{};{}H", row + 1, col + 1).into_bytes();
     out.extend(encode_sixel(
         rgba,
         usize::try_from(image_width).unwrap_or(usize::MAX),
         usize::try_from(image_height).unwrap_or(usize::MAX),
         target_w,
-        target_h,
+        fit_h,
     ));
     out
 }
@@ -97,12 +114,12 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with(
-                "\x1b[4;6H\x1bP0;1;0;0;1;1;0;0;0;0;0;0q\"1;1;16;32#181;2;100;0;0",
+                "\x1b[4;6H\x1bP0;1;0;0;1;1;0;0;0;0;0;0q\"0;0;16;16#1;2;100;0;0",
             ),
-            "the frame places row 4 col 6, declares a 16x32 width-first extent, and defines its red register: {text}"
+            "the frame anchors the 0-based row 3 placement at 1-based row 4 col 6, declares a 16x16 width-first extent at the graphics position, and defines its only colour as the first register: {text}"
         );
         assert!(
-            text.contains("#181!16~$"),
+            text.contains("#1!16~$"),
             "the register paints a full band with RLE: {text}"
         );
         assert!(
@@ -132,6 +149,53 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "\x1b[1;1H",
             "no Sixel is emitted"
+        );
+    }
+
+    #[test]
+    fn frame_header_and_payload_declare_the_same_raster() {
+        // A relayed preview frame that carries only its leading bands paints a strip
+        // at the top of its placement. The encoder itself emits one band for every
+        // declared row, so a header/payload mismatch points at the frame supply.
+        let rgba = rgba_fill(840, 480, 200, 120, 40);
+        let out = encode_frame(&rgba, 840, 480, 12, 28, 60, 18, 1, 36);
+        let body = &out[out.iter().position(|byte| *byte == b'q').unwrap() + 1..out.len() - 2];
+        let header = &body[body.iter().position(|byte| *byte == b'"').unwrap() + 1..];
+        let header = &header[..header.iter().position(|byte| *byte == b'#').unwrap()];
+        let declared: Vec<u32> = header
+            .split(|byte: &u8| *byte == b';')
+            .filter_map(|field| std::str::from_utf8(field).ok()?.parse().ok())
+            .collect();
+        let bands = body.iter().filter(|byte| **byte == b'-').count() as u32;
+        assert_eq!(
+            declared.len(),
+            4,
+            "DECGRA declares left;top;width;height: {header:?}"
+        );
+        let declared_height = declared.get(3).copied().unwrap_or(0);
+        assert!(
+            bands * 6 >= declared_height && bands.saturating_sub(1) * 6 < declared_height,
+            "the payload carries every band the header declares, so a short payload is a frame-supply bug: bands={bands} declared={declared_height}"
+        );
+    }
+
+    #[test]
+    fn frame_keeps_the_source_aspect_inside_a_taller_placement() {
+        // The live preview placement is clipped to the pane width (60 columns) while
+        // the source is 840x480, so a stretch-to-rectangle frame paints 720x504 and
+        // distorts the image vertically by a quarter.
+        let rgba = rgba_fill(840, 480, 200, 120, 40);
+        let out = encode_frame(&rgba, 840, 480, 12, 28, 60, 18, 1, 36);
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let header = text
+            .split('"')
+            .nth(1)
+            .and_then(|rest| rest.split('#').next())
+            .unwrap_or("?")
+            .to_string();
+        assert_eq!(
+            header, "0;0;720;411",
+            "the frame fits the source height to the placement width at one scale"
         );
     }
 }
