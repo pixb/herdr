@@ -5196,17 +5196,17 @@ mod tests {
         let pane_id = PaneId::from_raw(1);
 
         pane.process_pty_bytes(pane_id, 0, b"A", &tx);
-        assert_eq!(pane.cursor_state().map(|c| (c.x, c.y)), Some((1, 0)));
+        assert_eq!(pane_cursor_cells(&pane), (1, 0));
 
         // Four bands => 24px; default 16px cells => two rows of advance.
         let result =
             pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;2;100;100~~~---~\x1b\\tail", &tx);
         assert!(result.request_render);
-        let (x, y) = pane
-            .cursor_state()
-            .map(|cursor| (cursor.x, cursor.y))
-            .expect("cursor");
-        assert_eq!((x, y), (4, 2), "trailing text starts below the image");
+        assert_eq!(
+            pane_cursor_cells(&pane),
+            (4, 2),
+            "trailing text starts below the image"
+        );
     }
 
     #[test]
@@ -5222,11 +5222,20 @@ mod tests {
         // The child immediately positions the cursor; no synthetic advance.
         pane.process_pty_bytes(pane_id, 0, b"\x1bPq~~~---~\x1b\\\x1b[5;10H", &tx);
 
-        let (x, y) = pane
-            .cursor_state()
-            .map(|cursor| (cursor.x, cursor.y))
-            .expect("cursor");
-        assert_eq!((x, y), (9, 4));
+        assert_eq!(pane_cursor_cells(&pane), (9, 4));
+    }
+
+    /// The pane's real cursor cell, without the Windows cursor report settle.
+    ///
+    /// On Windows, public cursor reporting deliberately lags one write behind the
+    /// terminal (`CURSOR_POSITION_SETTLE_ENABLED`), so `cursor_state` read right
+    /// after a write reports the previous frame's cell. These graphics tests
+    /// protect where the parser places the cursor, so they read the raw cursor.
+    /// The report lag itself is covered by the cursor settle tests.
+    fn pane_cursor_cells(pane: &GhosttyPaneTerminal) -> (u16, u16) {
+        let mut core = pane.core.lock().expect("core");
+        let cursor = current_cursor_state(&mut core).expect("cursor");
+        (cursor.x, cursor.y)
     }
 
     #[test]
@@ -5241,18 +5250,10 @@ mod tests {
         pane.process_pty_bytes(pane_id, 0, b"A", &tx);
         pane.process_pty_bytes(pane_id, 0, b"\x1bPq~\x1b\\", &tx);
 
-        let (x, y) = pane
-            .cursor_state()
-            .map(|cursor| (cursor.x, cursor.y))
-            .expect("cursor");
-        assert_eq!((x, y), (0, 1));
+        assert_eq!(pane_cursor_cells(&pane), (0, 1));
 
         pane.process_pty_bytes(pane_id, 0, b"tail", &tx);
-        let (x, y) = pane
-            .cursor_state()
-            .map(|cursor| (cursor.x, cursor.y))
-            .expect("cursor");
-        assert_eq!((x, y), (4, 1));
+        assert_eq!(pane_cursor_cells(&pane), (4, 1));
     }
 
     #[test]
@@ -5267,11 +5268,10 @@ mod tests {
         pane.process_pty_bytes(pane_id, 0, b"A", &tx);
         pane.process_pty_bytes(pane_id, 0, b"\x1bP1000pGARBAGE\x1b\\X", &tx);
 
-        let (x, y) = pane
-            .cursor_state()
-            .map(|cursor| (cursor.x, cursor.y))
-            .expect("cursor");
-        assert_eq!((x, y), (2, 0));
+        // The DCS string is consumed as a string: its payload never reaches the
+        // grid, and the text behind the terminator lands right after `A`.
+        assert_eq!(pane.visible_text().trim(), "AX");
+        assert_eq!(pane_cursor_cells(&pane), (2, 0));
     }
 
     #[test]
@@ -5306,11 +5306,11 @@ mod tests {
 
         // The synthetic advance still places trailing text below the image:
         // rows = ceil(12 / 16) = 1, then "tail" writes 4 columns.
-        let (x, y) = pane
-            .cursor_state()
-            .map(|cursor| (cursor.x, cursor.y))
-            .expect("cursor");
-        assert_eq!((x, y), (4, 1), "trailing text below the image");
+        assert_eq!(
+            pane_cursor_cells(&pane),
+            (4, 1),
+            "trailing text below the image"
+        );
     }
 
     #[test]
@@ -5509,11 +5509,7 @@ mod tests {
         pane.process_pty_bytes(pane_id, 0, b"A", &tx);
         pane.process_pty_bytes(pane_id, 0, b"\x1bPq~~~---~\x1b\\tail", &tx);
 
-        let (x, y) = pane
-            .cursor_state()
-            .map(|cursor| (cursor.x, cursor.y))
-            .expect("cursor");
-        assert_eq!((x, y), (5, 0));
+        assert_eq!(pane_cursor_cells(&pane), (5, 0));
         crate::sixel::set_mode(None);
     }
 
