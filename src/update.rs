@@ -1983,6 +1983,14 @@ fn is_mise_managed_install() -> bool {
     is_mise_managed_exe_path_following_links(&current_exe)
 }
 
+fn is_pacman_managed_install() -> bool {
+    let Ok(current_exe) = env::current_exe() else {
+        return false;
+    };
+
+    is_pacman_managed_exe_path_following_links(&current_exe)
+}
+
 pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static str> {
     let Ok(current_exe) = env::current_exe() else {
         return None;
@@ -1999,6 +2007,8 @@ pub(crate) fn package_manager_channel_update_guidance_for_current_install() -> O
         Some("Use `mise upgrade herdr` to update mise installs.")
     } else if is_nix_managed_install() {
         Some("Update through Nix to update Nix-managed Herdr installs.")
+    } else if is_pacman_managed_install() {
+        Some("Update with `pacman -Syu` using the package that provides Herdr.")
     } else {
         None
     }
@@ -2015,6 +2025,10 @@ fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
         )
     } else if is_nix_store_exe_path_following_links(path) {
         Some("preview channel is only available for direct Herdr installs; Nix installs update through Nix")
+    } else if is_pacman_managed_exe_path_following_links(path) {
+        Some(
+            "preview channel is only available for direct Herdr installs; pacman installs update through the package that provides Herdr",
+        )
     } else {
         None
     }
@@ -2025,6 +2039,7 @@ pub(crate) fn is_package_manager_managed_exe_path(path: &Path) -> bool {
     is_homebrew_managed_exe_path_following_links(path)
         || is_mise_managed_exe_path_following_links(path)
         || is_nix_store_exe_path_following_links(path)
+        || is_pacman_managed_exe_path_following_links(path)
 }
 
 #[cfg(not(unix))]
@@ -2050,17 +2065,32 @@ fn is_nix_store_exe_path_following_links(path: &Path) -> bool {
         .is_ok_and(|path| is_nix_store_exe_path(&path))
 }
 
+fn is_pacman_managed_exe_path_following_links(path: &Path) -> bool {
+    if is_pacman_managed_exe_path(path) {
+        return true;
+    }
+
+    path.canonicalize()
+        .is_ok_and(|path| is_pacman_managed_exe_path(&path))
+}
+
 fn is_mise_managed_exe_path_following_links(path: &Path) -> bool {
     if is_mise_managed_exe_path(path) {
         return true;
     }
-
     path.canonicalize()
         .is_ok_and(|path| is_mise_managed_exe_path(&path))
 }
 
 fn is_nix_store_exe_path(path: &Path) -> bool {
     path.starts_with("/nix/store")
+}
+
+/// Pacman owns `/usr/bin` and never installs under `/usr/local`, so a binary in
+/// `/usr/bin` is a package-manager install: self-update there would replace a
+/// packaged build with an upstream one behind the package manager's back.
+fn is_pacman_managed_exe_path(path: &Path) -> bool {
+    path.starts_with("/usr/bin")
 }
 
 fn is_mise_managed_exe_path(path: &Path) -> bool {
@@ -2216,10 +2246,20 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         );
     }
 
+    if is_pacman_managed_install() {
+        if channel == UpdateChannel::Preview {
+            return Err(
+                "self-update is disabled for pacman installs; preview is only available for direct Herdr installs".into(),
+            );
+        }
+        return Err(
+            "self-update is disabled for pacman installs; update with `pacman -Syu` using the package that provides Herdr".into(),
+        );
+    }
+
     if running_inside_herdr() {
         return Err("run `herdr update` outside herdr after detaching from the session".into());
     }
-
     eprintln!("checking {} channel for updates...", channel.as_str());
 
     let current = Version::current();
@@ -3178,6 +3218,21 @@ mod tests {
         let path = Path::new("/usr/local/bin/herdr");
 
         assert!(!is_nix_store_exe_path(path));
+        assert!(!is_pacman_managed_exe_path(path));
+        assert!(preview_channel_rejection_for_exe_path(path).is_none());
+    }
+
+    #[test]
+    fn pacman_managed_path_is_detected() {
+        #[cfg(unix)]
+        {
+            let path = Path::new("/usr/bin/herdr");
+
+            assert!(is_pacman_managed_exe_path(path));
+            assert!(is_package_manager_managed_exe_path(path));
+            assert!(preview_channel_rejection_for_exe_path(path)
+                .is_some_and(|message| message.contains("pacman")));
+        }
     }
 
     #[test]

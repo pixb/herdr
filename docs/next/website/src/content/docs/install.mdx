@@ -119,7 +119,7 @@ Herdr checks for new releases and notifies you in the app. You can update manual
 herdr update
 ```
 
-Use `herdr update` only for installs managed by Herdr's own installer. Update Homebrew, mise, and Nix installs through those package managers instead.
+Use `herdr update` only for installs managed by Herdr's own installer. Update Homebrew, mise, Nix, and pacman installs through those package managers instead; Herdr detects a binary in a package-manager location, such as `/usr/bin` on pacman systems, and refuses to overwrite it.
 
 Direct installs on Linux, macOS, and Windows use the stable update channel by default. To opt into preview builds from `master`, set the channel:
 
