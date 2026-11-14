@@ -27,6 +27,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - name: Build check matrix
+        id: matrix
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          # Hosted macOS arm64 runners are a capacity-constrained pool that a
+          # fork account cannot rely on, and a queued macOS leg is cancelled
+          # long before it runs. The canonical repository owns macOS coverage;
+          # forks validate the legs their runners reliably acquire.
+          value='[{"os":"ubuntu-latest","kind":"unix","nextest_filter":"all()"}'
+          if [ "$REPOSITORY" = "herdrdev/herdr" ]; then
+            value="$value,{\"os\":\"macos-latest\",\"kind\":\"unix\",\"nextest_filter\":\"not binary(live_handoff)\"}"
+          fi
+          value="$value,{\"os\":\"windows-latest\",\"kind\":\"windows\"}]"
+          printf 'value=%s\n' "$value" >> "$GITHUB_OUTPUT"
+
   conventional-commits:
     if: github.event_name != 'push' || github.ref_name == 'master'
     runs-on: ubuntu-latest
@@ -50,18 +72,11 @@ jobs:
 
   check:
     name: check (${{ matrix.os }})
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            kind: unix
-            nextest_filter: all()
-          - os: macos-latest
-            kind: unix
-            nextest_filter: not binary(live_handoff)
-          - os: windows-latest
-            kind: windows
+        include: ${{ fromJSON(needs.preflight.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:

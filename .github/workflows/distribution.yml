@@ -48,6 +48,11 @@ concurrency:
 
 jobs:
   validate:
+    # The published contract resolves stable release tags such as
+    # v0.9.5^{commit}. A fork does not carry the upstream tags, and pushing
+    # them into a fork would trigger the tag-driven release and preview
+    # pipelines, so this contract runs on the canonical repository only.
+    if: github.repository == 'herdrdev/herdr'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
