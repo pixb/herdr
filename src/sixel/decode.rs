@@ -164,13 +164,6 @@ pub(crate) fn decode_sixel(
                 i = next;
                 x = 0;
             }
-            b'q' => {
-                // Preamble terminator: `q` ends the raster attribute section,
-                // so it never paints band data.
-                drawing = false;
-                x = 0;
-                i = i.saturating_add(1);
-            }
             b'?' if !drawing && payload.get(i + 1).is_some_and(|b| b.is_ascii_digit()) => {
                 // Graphics-width parameter: the scan pass already recorded the
                 // width; skip the digits so they are not read as band data. Only a
@@ -201,9 +194,13 @@ pub(crate) fn decode_sixel(
                 // so skip the introducer and stop at the terminator. A lone
                 // `\` is band data (bit pattern 0x1d), never a terminator.
                 if payload.get(i + 1) == Some(&b'P') {
+                    // Consume the DCS parameter section through its `q`, so a
+                    // band-data `q` (bit pattern 0x32) in the body is never
+                    // mistaken for the preamble terminator. Headerless payloads
+                    // have no introducer, so their `q` bytes stay band data.
                     drawing = false;
                     x = 0;
-                    i = i.saturating_add(2);
+                    i = dcs_body_start(payload, i + 2);
                 } else if payload.get(i + 1) == Some(&b'\\') {
                     i = payload.len();
                 } else {
@@ -258,6 +255,18 @@ fn dcs_pbgmode(payload: &[u8]) -> Option<u8> {
         .and_then(|field| std::str::from_utf8(field).ok()?.parse().ok())
 }
 
+/// Index just past the `q` that ends the DCS parameter section starting at `i`.
+///
+/// The extractor hands over headerless payloads, so the only `q` that ends the
+/// introducer is the one right after `ESC P`'s parameters. A `q` anywhere in the
+/// body is band data (bit pattern 0x32) and must not reset the pen.
+fn dcs_body_start(payload: &[u8], i: usize) -> usize {
+    match payload[i..].iter().position(|byte| *byte == b'q') {
+        Some(offset) => (i + offset + 1).min(payload.len()),
+        None => payload.len(),
+    }
+}
+
 pub(crate) fn scan_pass(payload: &[u8]) -> (usize, bool, bool) {
     // Transparency comes from the frame's own Pbgmode. Payloads handed over without
     // their header keep the older DECGRA convention, where Herdr's encoder marked a
@@ -294,19 +303,15 @@ pub(crate) fn scan_pass(payload: &[u8]) -> (usize, bool, bool) {
                 }
             }
 
-            b'q' => {
-                // Preamble terminator: `…P…q` ends the raster attributes, so
-                // `q` must not count as band data in the width scan.
-                x = 0;
-                i = i.saturating_add(1);
-            }
             0x1b => {
                 // Frame introducer `ESC P` (skip) and `ESC \` (stop): framing
                 // bytes are not band data, so they must not move the pen. A lone
                 // `\` is band data, never a terminator.
                 if payload.get(i + 1) == Some(&b'P') {
+                    // Skip the DCS parameters through their `q`; a `q` in the
+                    // body is band data (bit pattern 0x32), not a terminator.
                     x = 0;
-                    i = i.saturating_add(2);
+                    i = dcs_body_start(payload, i + 2);
                 } else if payload.get(i + 1) == Some(&b'\\') {
                     i = payload.len();
                 } else {
@@ -655,6 +660,47 @@ mod tests {
     }
 
     #[test]
+    fn q_is_band_data_not_the_preamble_terminator() {
+        // 0x71 is a legal band character (bit pattern 0x32). Headerless payloads
+        // (the extractor strips the DCS header) have no preamble `q`, so reading
+        // one as the terminator resets the pen mid-line: the tail paints over the
+        // head and the rest of the line is lost.
+        let payload = b"#1;2;100;0;0@q@";
+        let (width, _, _) = scan_pass(payload);
+        assert_eq!(
+            width, 3,
+            "the band-data `q` advances the pen, it does not reset it"
+        );
+        let image = decode_sixel(payload, 6, Some([0, 0, 0, 255])).expect("frame decodes");
+        assert_eq!(image.width, 3);
+        // `@` paints row 0; `q` paints rows 1, 4 and 5.
+        for (x, y) in [(0, 0), (1, 1), (1, 4), (1, 5), (2, 0)] {
+            assert_eq!(
+                px(&image.rgba, 3, x, y),
+                [255, 0, 0, 255],
+                "column {x} row {y} paints"
+            );
+        }
+        assert_eq!(
+            px(&image.rgba, 3, 1, 0),
+            [0, 0, 0, 255],
+            "a row the `q` does not set stays background"
+        );
+    }
+
+    #[test]
+    fn full_frame_skips_only_the_preamble_q() {
+        // The `q` after the DCS parameters ends the preamble; the `q` in the body
+        // is band data. Only the first `q` may reset the pen.
+        let payload = b"\x1bP0;0;0q#1;2;100;0;0@q@\x1b\\";
+        let (width, _, _) = scan_pass(payload);
+        assert_eq!(width, 3, "the body `q` still advances the pen");
+        let image = decode_sixel(payload, 6, None).expect("frame decodes");
+        assert_eq!(image.width, 3);
+        assert_eq!(px(&image.rgba, 3, 1, 4), [255, 0, 0, 255]);
+    }
+
+    #[test]
     fn transparency_follows_the_dcs_pbgmode_and_decgra_is_only_a_fallback() {
         let with_header = b"\x1bP0;0;0;0;1;1;0;0;0;0;0;0q\"1;1;10;6#1;2;100;0;0~\x1b\\";
         let (_, transparent, _) = scan_pass(with_header);
@@ -916,8 +962,9 @@ mod tests {
     /// parameter, so treating them as a parameter shifts every later band's pen.
     #[test]
     fn leading_transparent_run_is_band_data_not_a_width_parameter() {
-        // Columns 2 and 6 painted, columns 0, 1, 3, 4, 5 transparent.
-        let payload = b"q\"1;1;6;7#3;2;100;0;0#0??#3~#0???#3~$-\x1b\\";
+        // Columns 2 and 6 painted, columns 0, 1, 3, 4, 5 transparent. The
+        // extractor strips the DCS `ESC P…q` header, so the payload is the body.
+        let payload = b"\"1;1;6;7#3;2;100;0;0#0??#3~#0???#3~$-\x1b\\";
         let (width, transparent, drawing) = scan_pass(payload);
         assert_eq!(width, 7, "width counts the painted columns");
         assert!(transparent, "transparent background");
@@ -945,10 +992,11 @@ mod tests {
         }
     }
 
-    /// `?<W>;<dir>` after the preamble still sets the width ceiling.
+    /// `?<W>;<dir>` before any band data still sets the width ceiling. The
+    /// extractor strips the DCS `ESC P…q` header, so the payload starts at `?`.
     #[test]
     fn graphics_width_parameter_still_widens_the_frame() {
-        let payload = b"q?40;1#0#1A$-\\x1b\\";
+        let payload = b"?40;1#0#1A$-\x1b\\";
         let (width, _, _) = scan_pass(payload);
         assert_eq!(width, 40, "graphics-width parameter widens the image");
     }
