@@ -209,6 +209,38 @@ pub(crate) struct RelayedSixelImage {
     pub image_id: u32,
     pub row: u16,
     pub col: u16,
+    /// Painted height in pixels, used to tell fully painted rows from the
+    /// trailing sliver a rounded-up placement claims.
+    painted_px: u32,
+    /// Cell content under the placement, captured when it was relayed. A later
+    /// PTY write that changes those cells must drop the placement: the child
+    /// paints the pixels, the parser keeps the placement, and the client would
+    /// otherwise repaint the image over the new text.
+    snapshot: Option<RelaySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelaySnapshotRect {
+    row: i32,
+    col: i32,
+    cols: u32,
+    rows: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelaySnapshotCell {
+    wide: crate::ghostty::CellWide,
+    has_styling: bool,
+    style: crate::ghostty::CellStyle,
+    symbol: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelaySnapshot {
+    rect: RelaySnapshotRect,
+    viewport_cols: u16,
+    viewport_rows: u16,
+    cells: Vec<RelaySnapshotCell>,
 }
 
 pub(crate) struct GhosttyPaneCore {
@@ -1974,6 +2006,7 @@ impl GhosttyPaneTerminal {
                 in_progress_default_color_event,
                 terminal_responses,
             );
+            invalidate_overwritten_sixel_images(core, None);
             return;
         }
 
@@ -1986,6 +2019,7 @@ impl GhosttyPaneTerminal {
                 "sixel segments extracted"
             );
         }
+        let mut exempt_from_invalidation = None;
         for (index, segment) in segments.into_iter().enumerate() {
             let (seg_start, seg_end) = (segment.start, segment.end);
             // M3: a child-initiated screen erase or DECSDM toggle must drop
@@ -2046,12 +2080,24 @@ impl GhosttyPaneTerminal {
                 segment_in_progress,
                 terminal_responses,
             );
+            // The segment's text is in the grid now. If it covers a relayed
+            // frame's cells, drop that placement before considering the frame
+            // this segment carries. The text a synthetic advance places after
+            // a frame is our own "below the image" cursor move, not an
+            // overwrite, so the frame it belongs to is exempt for that one
+            // trailing segment.
+            let mut exempt = std::mem::take(&mut exempt_from_invalidation);
+            if segment.inject.is_some() {
+                exempt = None;
+            }
+            invalidate_overwritten_sixel_images(core, exempt);
 
             if let Some(pixel_height) = segment.inject {
                 // M2: decode the completed frame and relay it into the same
                 // terminal core as a Kitty image. The placement lands at the
                 // current cursor (the frame's start); the synthetic advance
                 // below then starts trailing text below the image.
+                let mut last_relayed_image_id = None;
                 if let Some(payload) = segment.payload.as_deref() {
                     let background = core
                         .initial_default_background
@@ -2074,7 +2120,7 @@ impl GhosttyPaneTerminal {
                         }
                         core.terminal.write(&delete);
                     }
-                    let image_id = crate::sixel::forward::relay_sixel_frame(
+                    let relayed = crate::sixel::forward::relay_sixel_frame(
                         &mut core.terminal,
                         payload,
                         pixel_height,
@@ -2090,7 +2136,7 @@ impl GhosttyPaneTerminal {
                             .count();
                         tracing::info!(
                             payload = payload.len(),
-                            relayed = image_id.is_some(),
+                            relayed = relayed.is_some(),
                             pixel_height,
                             bands,
                             filled_bands,
@@ -2098,9 +2144,42 @@ impl GhosttyPaneTerminal {
                             "sixel relay attempt"
                         );
                     }
-                    if let Some(image_id) = image_id {
-                        core.sixel_image_ids
-                            .push(RelayedSixelImage { image_id, row, col });
+                    if let Some(frame) = relayed {
+                        let covered_rows =
+                            fully_covered_relay_rows(pixel_height, core.cell_height_px)
+                                .min(frame.rows);
+                        // Blank the cells the frame paints over. Sixel covers
+                        // pixels, not cells, so the pane buffer keeps the text
+                        // printed before the image. Snapshotting that stale
+                        // text makes a later redraw of the same text look
+                        // unchanged, and a placement that must be dropped
+                        // survives. Blanking first means the snapshot baseline
+                        // is empty and any text the child prints under the
+                        // image is an overwrite.
+                        clear_cells_under_relay(
+                            &mut core.terminal,
+                            &core.render_state,
+                            row,
+                            col,
+                            frame.cols,
+                            covered_rows,
+                        );
+                        let _ = core.render_state.update(&core.terminal);
+                        let snapshot = capture_relay_snapshot(
+                            &core.render_state,
+                            row,
+                            col,
+                            frame.cols,
+                            covered_rows,
+                        );
+                        core.sixel_image_ids.push(RelayedSixelImage {
+                            image_id: frame.image_id,
+                            row,
+                            col,
+                            painted_px: pixel_height,
+                            snapshot,
+                        });
+                        last_relayed_image_id = Some(frame.image_id);
                     }
                 }
                 let peek = &bytes[seg_end..];
@@ -2112,6 +2191,7 @@ impl GhosttyPaneTerminal {
                     let advance = crate::sixel::extractor::synthetic_cursor_advance(rows);
                     core.terminal.write(&advance);
                     terminal_responses.extend(self.drain_pending_pty_responses());
+                    exempt_from_invalidation = last_relayed_image_id;
                 }
             }
         }
@@ -3169,6 +3249,283 @@ fn relayed_placement_origin(
         .and_then(|cursor| cursor.viewport)
         .map(|viewport| (viewport.y, viewport.x))
         .unwrap_or((0, 0))
+}
+
+fn clip_relay_rect(
+    row: i32,
+    col: i32,
+    cols: u32,
+    rows: u32,
+    viewport_cols: u16,
+    viewport_rows: u16,
+) -> Option<RelaySnapshotRect> {
+    let top = i64::from(row).max(0);
+    let left = i64::from(col).max(0);
+    let bottom = (i64::from(row) + i64::from(rows)).min(i64::from(viewport_rows));
+    let right = (i64::from(col) + i64::from(cols)).min(i64::from(viewport_cols));
+    if bottom <= top || right <= left {
+        return None;
+    }
+    Some(RelaySnapshotRect {
+        row: top as i32,
+        col: left as i32,
+        cols: (right - left) as u32,
+        rows: (bottom - top) as u32,
+    })
+}
+
+/// Rows whose cells the relayed frame paints completely. Sixel bands are 6 px
+/// tall, so the last row of a placement is often a sliver (a 114 px frame in
+/// 28 px cells claims 5 rows and paints 2 px of the fifth). Previewers print
+/// text on the row right below the image every time the preview redraws, so a
+/// sliver row must not count as image-owned or the image vanishes at once.
+fn fully_covered_relay_rows(painted_px: u32, cell_height_px: u32) -> u32 {
+    if cell_height_px == 0 {
+        return u32::MAX;
+    }
+    painted_px.saturating_div(cell_height_px).max(1)
+}
+
+/// Overwrite the cells under a relayed frame with spaces, restoring the cursor
+/// afterwards. The child painted pixels over this region; its text buffer must
+/// show the same blank baseline the client will repaint, so the relay snapshot
+/// can detect the next text draw as an overwrite.
+fn clear_cells_under_relay(
+    terminal: &mut crate::ghostty::Terminal,
+    render_state: &crate::ghostty::RenderState,
+    row: u16,
+    col: u16,
+    grid_cols: u32,
+    grid_rows: u32,
+) {
+    let Ok(viewport_cols) = render_state.cols() else {
+        return;
+    };
+    let Ok(viewport_rows) = render_state.rows() else {
+        return;
+    };
+    let Some(rect) = clip_relay_rect(
+        i32::from(row),
+        i32::from(col),
+        grid_cols,
+        grid_rows,
+        viewport_cols,
+        viewport_rows,
+    ) else {
+        return;
+    };
+    let mut bytes = Vec::with_capacity(16 + (rect.rows as usize) * (rect.cols as usize + 12));
+    bytes.extend_from_slice(b"\x1b[s");
+    let left = u32::try_from(rect.col).unwrap_or(0) + 1;
+    for r in 0..rect.rows {
+        let screen_row = u32::try_from(rect.row + r as i32).unwrap_or(0) + 1;
+        bytes.extend_from_slice(format!("\x1b[{screen_row};{left}H").as_bytes());
+        bytes.resize(bytes.len() + rect.cols as usize, b' ');
+    }
+    bytes.extend_from_slice(b"\x1b[u]");
+    terminal.write(&bytes);
+}
+
+/// Record the cells a relayed Sixel frame paints over. The render state must
+/// already be current (the relay path updates it right before placing).
+fn capture_relay_snapshot(
+    render_state: &crate::ghostty::RenderState,
+    origin_row: u16,
+    origin_col: u16,
+    grid_cols: u32,
+    grid_rows: u32,
+) -> Option<RelaySnapshot> {
+    let viewport_cols = render_state.cols().ok()?;
+    let viewport_rows = render_state.rows().ok()?;
+    let rect = clip_relay_rect(
+        i32::from(origin_row),
+        i32::from(origin_col),
+        grid_cols,
+        grid_rows,
+        viewport_cols,
+        viewport_rows,
+    )?;
+    let mut row_iterator = crate::ghostty::RowIterator::new().ok()?;
+    let mut row_cells = crate::ghostty::RowCells::new().ok()?;
+    let mut rows = render_state.populate_row_iterator(&mut row_iterator).ok()?;
+    let mut grapheme_bytes = Vec::new();
+    let mut symbol = String::new();
+    let mut cells = Vec::with_capacity((rect.cols as usize).saturating_mul(rect.rows as usize));
+    let bottom = rect.row + rect.rows as i32;
+    let right = rect.col + rect.cols as i32;
+    let mut y = 0i32;
+    while y < bottom && rows.next() {
+        if y >= rect.row {
+            let mut iter = rows.populate_cells(&mut row_cells).ok()?;
+            let mut x = 0i32;
+            while x < right && iter.next() {
+                if x >= rect.col {
+                    cells.push(relay_snapshot_cell(&iter, &mut grapheme_bytes, &mut symbol).ok()?);
+                }
+                x += 1;
+            }
+        }
+        y += 1;
+    }
+    if cells.len() != (rect.cols as usize).saturating_mul(rect.rows as usize) {
+        return None;
+    }
+    Some(RelaySnapshot {
+        rect,
+        viewport_cols,
+        viewport_rows,
+        cells,
+    })
+}
+
+fn relay_snapshot_cell(
+    cells: &crate::ghostty::RowCellIter<'_>,
+    grapheme_bytes: &mut Vec<u8>,
+    symbol: &mut String,
+) -> Result<RelaySnapshotCell, crate::ghostty::Error> {
+    let basic = cells.basic_data()?;
+    let text = ghostty_buffer_symbol_into(
+        cells,
+        basic.wide,
+        crate::kitty_graphics::is_enabled(),
+        grapheme_bytes,
+        symbol,
+    )?;
+    Ok(RelaySnapshotCell {
+        wide: basic.wide,
+        has_styling: basic.has_styling,
+        style: basic.style,
+        symbol: text.to_owned(),
+    })
+}
+
+/// True when a dirty row inside the snapshot rect no longer holds the content
+/// captured when the frame was relayed. The comparison is per cell, so writes
+/// beside the image (another column of the same row) and cursor-only dirty
+/// marks do not count as an overwrite.
+fn relay_region_changed(
+    render_state: &crate::ghostty::RenderState,
+    snapshot: &RelaySnapshot,
+) -> bool {
+    let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
+        return false;
+    };
+    let Ok(mut row_cells) = crate::ghostty::RowCells::new() else {
+        return false;
+    };
+    let Ok(mut rows) = render_state.populate_row_iterator(&mut row_iterator) else {
+        return false;
+    };
+    let top = snapshot.rect.row;
+    let bottom = top + snapshot.rect.rows as i32;
+    let left = snapshot.rect.col;
+    let right = left + snapshot.rect.cols as i32;
+    let stride = snapshot.rect.cols as usize;
+    let mut grapheme_bytes = Vec::new();
+    let mut symbol = String::new();
+    while let Some(y) = rows.next_dirty() {
+        let y = i32::from(y);
+        if y < top || y >= bottom {
+            continue;
+        }
+        let Ok(mut cells) = rows.populate_cells(&mut row_cells) else {
+            return false;
+        };
+        let mut x = 0i32;
+        while x < right && cells.next() {
+            if x >= left {
+                let index = (y - top) as usize * stride + (x - left) as usize;
+                let Some(expected) = snapshot.cells.get(index) else {
+                    return false;
+                };
+                match relay_snapshot_cell(&cells, &mut grapheme_bytes, &mut symbol) {
+                    Ok(current) if current == *expected => {}
+                    Ok(_) => return true,
+                    Err(_) => return false,
+                }
+            }
+            x += 1;
+        }
+    }
+    false
+}
+
+/// Drop relayed Sixel placements whose cells the child has overwritten. The VT
+/// core keeps Kitty placements on text writes the way a Kitty child owns its
+/// images, but a Sixel previewer paints into the cell grid: once it writes new
+/// text over the cells, the pixels must stop covering them. Deleting the
+/// placement makes the client paint the cells and erase the stale image.
+fn invalidate_overwritten_sixel_images(core: &mut GhosttyPaneCore, exempt: Option<u32>) {
+    if core.sixel_image_ids.is_empty() {
+        return;
+    }
+    let GhosttyPaneCore {
+        terminal,
+        render_state,
+        sixel_image_ids,
+        cell_height_px,
+        ..
+    } = core;
+    let Ok(placements) = terminal.kitty_image_placements_with_data_filter(|_| false) else {
+        return;
+    };
+    if render_state.update(terminal).is_err() {
+        return;
+    }
+    let viewport_cols = render_state.cols().unwrap_or(0);
+    let viewport_rows = render_state.rows().unwrap_or(0);
+    let mut delete = Vec::new();
+    for image in sixel_image_ids.iter_mut() {
+        let Some(placement) = placements
+            .iter()
+            .find(|placement| placement.image_id == image.image_id)
+        else {
+            image.snapshot = None;
+            continue;
+        };
+        let render = placement.render;
+        let Some(rect) = clip_relay_rect(
+            render.viewport_row,
+            render.viewport_col,
+            render.grid_cols,
+            fully_covered_relay_rows(image.painted_px, *cell_height_px).min(render.grid_rows),
+            viewport_cols,
+            viewport_rows,
+        ) else {
+            // Offscreen placements keep no snapshot so returning to the
+            // viewport recaptures whatever now sits under them.
+            image.snapshot = None;
+            continue;
+        };
+        match image.snapshot.as_ref() {
+            Some(snapshot)
+                if snapshot.rect == rect
+                    && snapshot.viewport_cols == viewport_cols
+                    && snapshot.viewport_rows == viewport_rows =>
+            {
+                if Some(image.image_id) != exempt && relay_region_changed(render_state, snapshot) {
+                    delete.push(image.image_id);
+                }
+            }
+            _ => {
+                image.snapshot = capture_relay_snapshot(
+                    render_state,
+                    rect.row as u16,
+                    rect.col as u16,
+                    rect.cols,
+                    rect.rows,
+                );
+            }
+        }
+    }
+    if !delete.is_empty() {
+        let mut bytes = Vec::new();
+        for image_id in &delete {
+            crate::kitty_graphics::encode_delete_image(&mut bytes, *image_id);
+        }
+        terminal.write(&bytes);
+        sixel_image_ids.retain(|image| !delete.contains(&image.image_id));
+    }
 }
 
 fn keyboard_negotiated_nothing(terminal: &crate::ghostty::Terminal) -> bool {
@@ -5310,6 +5667,200 @@ mod tests {
             pane_cursor_cells(&pane),
             (4, 1),
             "trailing text below the image"
+        );
+    }
+
+    #[test]
+    fn text_over_a_relayed_sixel_frame_drops_the_placement() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.resize(24, 80, 10, 16);
+        let pane_id = PaneId::from_raw(1);
+
+        // A 20x6 px frame is 2 cols by 1 row at the origin (top-left).
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~\x1b\\", &tx);
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .len(),
+            1,
+            "frame relayed"
+        );
+
+        // The previewer now writes text into the image's cells instead of
+        // emitting an explicit clear.
+        let result = pane.process_pty_bytes(pane_id, 0, b"\x1b[1;1Hhello", &tx);
+        assert!(result.request_render);
+        let core = pane.core.lock().unwrap();
+        assert!(
+            core.terminal.kitty_image_placements().unwrap().is_empty(),
+            "text over the painted cells drops the stale placement"
+        );
+        assert!(core.sixel_image_ids.is_empty(), "tracked id dropped");
+    }
+
+    #[test]
+    fn text_on_a_partial_sixel_sliver_row_keeps_the_placement() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.resize(24, 80, 10, 28);
+        let pane_id = PaneId::from_raw(1);
+
+        // 19 bands = 114 px: 4 whole rows plus a 2 px sliver in the fifth.
+        let mut payload = b"\x1bPq#1;100;0;0".to_vec();
+        for band in 0..19 {
+            if band > 0 {
+                payload.extend_from_slice(b"-");
+            }
+            for _ in 0..6 {
+                payload.extend_from_slice(b"!20~");
+                payload.extend_from_slice(b"$");
+            }
+        }
+        payload.extend_from_slice(b"\x1b\\");
+        pane.process_pty_bytes(pane_id, 0, &payload, &tx);
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .len(),
+            1,
+            "frame relayed"
+        );
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[5;1HX", &tx);
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .len(),
+            1,
+            "text on the sliver row keeps the image"
+        );
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2;1HY", &tx);
+        assert!(
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .is_empty(),
+            "text on a fully painted row drops the image"
+        );
+    }
+
+    #[test]
+    fn relaying_over_stale_text_drops_the_placement_when_that_text_returns() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.resize(24, 80, 10, 16);
+        let pane_id = PaneId::from_raw(1);
+
+        // A text preview occupies the cells the previewer later paints over.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[1;1HAB\r\nCD\r\n", &tx);
+        // The image preview lands on the same origin, covering "AB".
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[1;1H\x1bPq#1;100;0;0!20~\x1b\\", &tx);
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .len(),
+            1,
+            "image relayed over the old text"
+        );
+
+        // Switching back to the text preview prints the same characters lf
+        // cached. The relay blanked those cells, so this is an overwrite.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[1;1HAB", &tx);
+        let core = pane.core.lock().unwrap();
+        assert!(
+            core.terminal.kitty_image_placements().unwrap().is_empty(),
+            "redrawing the covered text drops the image"
+        );
+        assert!(core.sixel_image_ids.is_empty(), "tracked id dropped");
+    }
+
+    #[test]
+    fn text_beside_a_relayed_sixel_frame_keeps_the_placement() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.resize(24, 80, 10, 16);
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~\x1b\\", &tx);
+        // A write on the same row, outside the placement's two columns, must
+        // not count as an overwrite.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[1;11HX", &tx);
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .len(),
+            1,
+            "the image still covers unchanged cells"
+        );
+    }
+
+    #[test]
+    fn resizing_a_relayed_sixel_frame_does_not_drop_it() {
+        let _guard = sixel_mode_test_lock();
+        crate::sixel::set_mode(None);
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.resize(24, 80, 10, 16);
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1bPq#1;100;0;0!20~\x1b\\", &tx);
+        pane.resize(30, 100, 10, 16);
+        // The next write runs the overwrite pass. A reflowed viewport must
+        // recapture the cells instead of treating the reflow as an overwrite.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[20;1HX", &tx);
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .terminal
+                .kitty_image_placements()
+                .unwrap()
+                .len(),
+            1,
+            "resizing does not erase the image"
         );
     }
 

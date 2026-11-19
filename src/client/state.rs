@@ -592,20 +592,19 @@ impl ClientState {
             frame_data
         };
         let track_changed = self.sixel_paint_active();
+        // Sixel frames cannot be erased by the terminal. A dropped painted frame
+        // must be written over now, in the same output that stops painting it,
+        // instead of waiting for a later compose that may never run; keep the
+        // pending flag as a backstop.
+        let repaint_after_graphics = graphics.repaint_required;
+        let repaint = self.repaint_pending || repaint_after_graphics;
         let encoded = if self.draw_host_cursor {
             self.blit_encoder
-                .encode_with_suppressed_visible_cursor_tracking(
-                    &frame_data,
-                    self.repaint_pending,
-                    track_changed,
-                )
+                .encode_with_suppressed_visible_cursor_tracking(&frame_data, repaint, track_changed)
         } else {
             self.blit_encoder
-                .encode_tracking(&frame_data, self.repaint_pending, track_changed)
+                .encode_tracking(&frame_data, repaint, track_changed)
         };
-        // Sixel frames cannot be erased by the terminal, so dropping one asks the
-        // next frame to repaint every cell over the stale pixels.
-        let repaint_after_graphics = graphics.repaint_required;
         // Text written by this frame can overwrite painted Sixel frames. Re-emit
         // those frames after the text in the same output instead of waiting for a
         // later compose the patch path may never run.
@@ -678,6 +677,50 @@ mod native_cleanup_tests {
         assert!(
             state.repaint_pending,
             "a dropped sixel frame must be written over by the next frame"
+        );
+    }
+
+    #[test]
+    fn a_sixel_erase_request_repaints_the_same_frame() {
+        fn one_cell_frame() -> crate::protocol::FrameData {
+            crate::protocol::FrameData {
+                cells: vec![crate::protocol::CellData {
+                    symbol: "A".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                }],
+                width: 1,
+                height: 1,
+                cursor: None,
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+            }
+        }
+
+        let mut state = ClientState::test_new();
+        state.kitty_graphics_enabled = true;
+        let mut output = Vec::new();
+        assert!(state.try_present_frame_to(&mut output, one_cell_frame()));
+        assert!(output.windows(1).any(|bytes| bytes == b"A"));
+
+        // The frame's cells are unchanged, so only the drop request can force a
+        // rewrite of them; it must happen now rather than on a later compose.
+        let mut graphics = crate::kitty_graphics::GraphicsOutput::from_bytes(Vec::new());
+        graphics.require_repaint();
+        output.clear();
+        assert!(state.try_present_frame_to(
+            &mut output,
+            frame_output::ComposedFrame {
+                frame: one_cell_frame(),
+                graphics,
+            }
+        ));
+        assert!(
+            output.windows(1).any(|bytes| bytes == b"A"),
+            "the dropped sixel frame is written over in this output"
         );
     }
 

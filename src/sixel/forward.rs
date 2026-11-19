@@ -41,9 +41,18 @@ fn encode_kitty_commands(image: &DecodedImage, image_id: u32, cols: u32, rows: u
     command
 }
 
+/// A Sixel frame relayed into the terminal core, with the grid-cell size of
+/// its placement so the caller can snapshot the cells it paints over.
+pub(crate) struct RelayedFrame {
+    pub image_id: u32,
+    pub cols: u32,
+    pub rows: u32,
+}
+
 /// Decode one complete Sixel frame and relay it into the terminal core as a
-/// Kitty image. Returns the synthetic image ID on success (so the pane can
-/// track it for clear-sync deletion), or `None` when the frame was dropped.
+/// Kitty image. Returns the synthetic image and its placement grid on success
+/// (so the pane can track it for clear-sync deletion), or `None` when the frame
+/// was dropped.
 ///
 /// The placement lands at the current cursor (the frame's start position);
 /// the caller injects the synthetic cursor advance afterwards so trailing
@@ -55,7 +64,7 @@ pub(crate) fn relay_sixel_frame(
     cell_width_px: u32,
     cell_height_px: u32,
     background: Option<[u8; 4]>,
-) -> Option<u32> {
+) -> Option<RelayedFrame> {
     let Ok(image) = decode_sixel(payload, pixel_height, background) else {
         tracing::debug!(
             pixel_height,
@@ -102,7 +111,11 @@ pub(crate) fn relay_sixel_frame(
         image_height = image.height,
         "sixel: relayed frame as Kitty placement"
     );
-    Some(image_id)
+    Some(RelayedFrame {
+        image_id,
+        cols,
+        rows,
+    })
 }
 
 /// Number of host cells that span `pixels` at the given cell size.
@@ -192,7 +205,7 @@ mod tests {
         // Parallel tests consume synthetic IDs from the shared counter, so
         // only the id space base is stable.
         assert!(
-            placed.is_some_and(|id| id >= SIXEL_IMAGE_ID_BASE),
+            placed.is_some_and(|frame| frame.image_id >= SIXEL_IMAGE_ID_BASE),
             "frame should relay"
         );
         let placements = terminal.kitty_image_placements().unwrap();
